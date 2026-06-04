@@ -27,7 +27,7 @@ def main():
     config = load_config()
     tc = config.get("training", {})
 
-    base_model = tc.get("base_model", "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit")
+    base_model = tc.get("base_model", "unsloth/Qwen3.5-4B")
     max_seq_length = tc.get("max_seq_length", 2048)
     lora_rank = tc.get("lora_rank", 64)
     lora_alpha = tc.get("lora_alpha", 128)

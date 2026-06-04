@@ -43,12 +43,13 @@ intents.message_content = True
 client = discord.Client(intents=intents)
 
 
-def build_prompt(context_messages):
+def build_prompt(context_messages, replied_to_id=None):
     """Format channel context the same way as training data."""
     lines = []
     for msg in context_messages:
         if msg.content.strip():
-            lines.append(f"{msg.author.display_name}: {msg.content.strip()}")
+            prefix = "(replied to) " if replied_to_id and msg.id == replied_to_id else ""
+            lines.append(f"{prefix}{msg.author.display_name}: {msg.content.strip()}")
     return "\n".join(lines)
 
 
@@ -88,7 +89,17 @@ async def on_message(message):
         history.append(msg)
     history.reverse()
 
-    context_text = build_prompt(history)
+    replied_to_id = None
+    if message.reference and message.reference.message_id:
+        replied_to_id = message.reference.message_id
+        if not any(m.id == replied_to_id for m in history):
+            try:
+                ref_msg = await message.channel.fetch_message(replied_to_id)
+                history.insert(0, ref_msg)
+            except discord.NotFound:
+                pass
+
+    context_text = build_prompt(history, replied_to_id=replied_to_id)
     if not context_text:
         return
 
