@@ -1,0 +1,43 @@
+# Copy this file to config.yaml and fill in your values
+
+# Discord bot token (from https://discord.com/developers/applications)
+bot_token: "YOUR_BOT_TOKEN_HERE"
+
+# The Discord server (guild) ID to scrape
+guild_id: 000000000000000000
+
+# Dinner's Discord user ID
+dinner_user_id: 000000000000000000
+
+# Scraper settings
+scraper:
+  # Number of context messages before each Dinner message
+  context_window: 10
+
+# Training settings
+training:
+  base_model: "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit"
+  epochs: 3
+  batch_size: 2
+  gradient_accumulation_steps: 4
+  learning_rate: 0.0002
+  max_seq_length: 2048
+  lora_rank: 64
+  lora_alpha: 128
+
+# Bot settings
+bot:
+  # Chance of replying to any message (0.0001 = 0.01%)
+  reply_chance: 0.0001
+  # Channel IDs the bot is allowed to reply in
+  allowed_channels:
+    - 000000000000000000
+  # Path to the GGUF model file
+  model_path: "data/model/dinner.gguf"
+  # Number of recent messages to use as context when generating a reply
+  context_messages: 10
+  # Maximum tokens in a generated reply
+  max_response_tokens: 256
+  # Generation parameters
+  temperature: 0.8
+  top_p: 0.9

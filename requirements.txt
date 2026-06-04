@@ -1,0 +1,19 @@
+# Discord
+discord.py>=2.3.0
+
+# Config
+pyyaml>=6.0
+
+# Data processing
+tqdm>=4.66.0
+
+# Training (install on the machine with the GPU)
+# unsloth
+# torch
+# transformers
+# datasets
+# trl
+# bitsandbytes
+
+# Inference (install on the machine running the bot)
+# llama-cpp-python
