@@ -65,6 +65,11 @@ async def main():
         print(f"Found {len(text_channels)} text channels in '{guild.name}'")
 
         for channel in text_channels:
+            out_path = os.path.join(RAW_DIR, f"{channel.id}_{channel.name}.json")
+            if os.path.exists(out_path):
+                print(f"\nSkipping #{channel.name} (already scraped)")
+                continue
+
             print(f"\nScraping #{channel.name}...")
             try:
                 with tqdm(desc=f"#{channel.name}", unit=" msgs") as pbar:
