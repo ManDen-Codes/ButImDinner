@@ -53,6 +53,7 @@ else:
         n_ctx=2048,
         n_gpu_layers=-1,
         verbose=False,
+        chat_format="chatml",
     )
     print("Model loaded!")
 
@@ -103,6 +104,7 @@ def generate_reply(context_text):
             stop=["\n\n"],
         )
         reply = response["choices"][0]["message"]["content"]
+        reply = re.sub(r"<think>.*?</think>", "", reply, flags=re.DOTALL)
         reply = re.sub(r"https?://\S+", "", reply)
         return reply.strip()
 
