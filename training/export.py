@@ -1,7 +1,9 @@
 import os
 
 import yaml
-from unsloth import FastLanguageModel
+from peft import PeftModel
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(SCRIPT_DIR)
@@ -16,35 +18,35 @@ def load_config():
 def main():
     config = load_config()
     tc = config.get("training", {})
-    max_seq_length = tc.get("max_seq_length", 2048)
+    base_model = tc.get("base_model", "unsloth/Qwen3-4B")
 
     adapter_path = os.path.join(ROOT_DIR, "data", "model", "lora_adapter")
-    output_dir = os.path.join(ROOT_DIR, "data", "model")
-    os.makedirs(output_dir, exist_ok=True)
+    merged_path = os.path.join(ROOT_DIR, "data", "model", "merged")
+    os.makedirs(merged_path, exist_ok=True)
 
-    print(f"Loading model with LoRA adapter from {adapter_path}")
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=adapter_path,
-        max_seq_length=max_seq_length,
-        load_in_4bit=True,
+    print(f"Loading base model: {base_model}")
+    model = AutoModelForCausalLM.from_pretrained(
+        base_model,
+        torch_dtype=torch.bfloat16,
+        device_map="cpu",
     )
+    tokenizer = AutoTokenizer.from_pretrained(base_model)
 
-    output_path = os.path.join(output_dir, "dinner.gguf")
-    print(f"Exporting to GGUF: {output_path}")
-    model.save_pretrained_gguf(
-        output_dir,
-        tokenizer,
-        quantization_method="q4_k_m",
-    )
+    print(f"Loading LoRA adapter from {adapter_path}")
+    model = PeftModel.from_pretrained(model, adapter_path)
 
-    # Unsloth saves as <model_name>-unsloth-Q4_K_M.gguf, rename it
-    for f in os.listdir(output_dir):
-        if f.endswith(".gguf") and f != "dinner.gguf":
-            src = os.path.join(output_dir, f)
-            os.rename(src, output_path)
-            break
+    print("Merging adapter into base model...")
+    model = model.merge_and_unload()
 
-    print(f"Done! Model saved to {output_path}")
+    print(f"Saving merged model to {merged_path}")
+    model.save_pretrained(merged_path, safe_serialization=True)
+    tokenizer.save_pretrained(merged_path)
+
+    print("\nMerge complete. Now convert to GGUF:")
+    print("  git clone https://github.com/ggerganov/llama.cpp")
+    print("  pip install -r llama.cpp/requirements.txt")
+    print(f"  python llama.cpp/convert_hf_to_gguf.py {merged_path} --outfile data/model/dinner_f16.gguf --outtype f16")
+    print("  llama.cpp/build/bin/llama-quantize data/model/dinner_f16.gguf data/model/dinner.gguf Q4_K_M")
 
 
 if __name__ == "__main__":

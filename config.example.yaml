@@ -14,17 +14,30 @@ scraper:
   # Number of context messages before each Dinner message
   context_window: 10
 
+# Recency weighting: recent messages are duplicated more times in the training set.
+# Each bucket applies to messages older than the previous but within `months` months.
+# The last bucket catches everything older.
+recency_weights:
+  - months: 6
+    weight: 4
+  - months: 12
+    weight: 3
+  - months: 24
+    weight: 2
+  - months: 9999
+    weight: 1
+
 # Training settings
 training:
-  base_model: "unsloth/Qwen3.5-4B"
-  epochs: 3
-  batch_size: 2
+  base_model: "unsloth/Qwen3-4B"
+  epochs: 5
+  batch_size: 4
   gradient_accumulation_steps: 4
   learning_rate: 0.0002
-  max_seq_length: 2048
+  max_seq_length: 512
   lora_rank: 64
   lora_alpha: 128
-
+  
 # Bot settings
 bot:
   # Chance of replying to any message (0.0001 = 0.01%)

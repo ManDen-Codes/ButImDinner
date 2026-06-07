@@ -3,6 +3,7 @@ import json
 import os
 import random
 import re
+from datetime import datetime, timezone
 
 import yaml
 
@@ -10,6 +11,8 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(SCRIPT_DIR)
 RAW_DIR = os.path.join(ROOT_DIR, "data", "raw")
 PROCESSED_DIR = os.path.join(ROOT_DIR, "data", "processed")
+
+URL_RE = re.compile(r"https?://\S+")
 
 
 def load_config():
@@ -19,7 +22,6 @@ def load_config():
 
 
 def load_all_messages():
-    """Load and merge all raw channel JSONs into one chronological list per channel."""
     channels = {}
     for path in glob.glob(os.path.join(RAW_DIR, "*.json")):
         with open(path, encoding="utf-8") as f:
@@ -31,12 +33,23 @@ def load_all_messages():
 
 
 def build_user_map(channels):
-    """Build a mapping of user ID -> display name from all messages."""
     user_map = {}
     for messages in channels.values():
         for msg in messages:
             user_map[msg["author_id"]] = msg["author_name"]
     return user_map
+
+
+def build_channel_map(channels):
+    ch_map = {}
+    for messages in channels.values():
+        if messages:
+            ch_map[messages[0]["channel_id"]] = messages[0]["channel_name"]
+    return ch_map
+
+
+def has_url(text):
+    return bool(URL_RE.search(text))
 
 
 def clean_content(content, user_map, channel_map):
@@ -51,41 +64,59 @@ def clean_content(content, user_map, channel_map):
 
     content = re.sub(r"<@!?(\d+)>", replace_user_mention, content)
     content = re.sub(r"<#(\d+)>", replace_channel_mention, content)
-    # Strip custom emoji to just the name
     content = re.sub(r"<a?:(\w+):\d+>", r":\1:", content)
     return content.strip()
 
 
-def build_channel_map(channels):
-    """Build channel ID -> name mapping."""
-    ch_map = {}
-    for messages in channels.values():
-        if messages:
-            ch_map[messages[0]["channel_id"]] = messages[0]["channel_name"]
-    return ch_map
+def clean_context_content(content, user_map, channel_map):
+    """Clean content for context — replace URLs with [link] instead of dropping."""
+    content = clean_content(content, user_map, channel_map)
+    content = URL_RE.sub("[link]", content)
+    return content.strip()
 
 
 def merge_consecutive(messages):
-    """Merge consecutive messages from the same author into one."""
     if not messages:
         return []
     merged = [messages[0].copy()]
     for msg in messages[1:]:
         if msg["author_id"] == merged[-1]["author_id"]:
             merged[-1]["content"] += "\n" + msg["content"]
+            if msg.get("attachments"):
+                merged[-1].setdefault("attachments", []).extend(msg["attachments"])
         else:
             merged.append(msg.copy())
     return merged
 
 
-def build_training_pairs(channels, config):
-    """Build (context, response) pairs for every Dinner message."""
+def recency_multiplier(timestamp_str, now, weights):
+    """Return how many copies of this sample to include based on age."""
+    ts = datetime.fromisoformat(timestamp_str)
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    months_old = (now - ts).days / 30.44
+    for bucket in weights:
+        if months_old <= bucket["months"]:
+            return bucket["weight"]
+    return weights[-1]["weight"]
+
+
+def build_training_pairs(channels, config, now):
     dinner_id = config["dinner_user_id"]
     context_window = config.get("scraper", {}).get("context_window", 10)
+    weights = config.get("recency_weights", [
+        {"months": 6,   "weight": 4},
+        {"months": 12,  "weight": 3},
+        {"months": 24,  "weight": 2},
+        {"months": 9999,"weight": 1},
+    ])
     user_map = build_user_map(channels)
     channel_map = build_channel_map(channels)
 
     pairs = []
+    skipped_url = 0
+    skipped_attachment = 0
+    skipped_short = 0
 
     for channel_name, messages in channels.items():
         msg_by_id = {m["id"]: m for m in messages}
@@ -93,15 +124,28 @@ def build_training_pairs(channels, config):
         for i, msg in enumerate(messages):
             if msg["author_id"] != dinner_id:
                 continue
+
+            # Drop responses with attachments
+            if msg.get("attachments"):
+                skipped_attachment += 1
+                continue
+
             cleaned = clean_content(msg["content"], user_map, channel_map)
-            if not cleaned:
+
+            # Drop responses with URLs
+            if has_url(cleaned):
+                skipped_url += 1
+                continue
+
+            # Drop responses that are too short after cleaning
+            if len(cleaned) < 3:
+                skipped_short += 1
                 continue
 
             # Gather preceding context
             start = max(0, i - context_window)
             context_msgs = messages[start:i]
 
-            # If Dinner replied to a specific message, ensure it's in context
             replied_to = None
             if msg["reply_to_id"] and msg["reply_to_id"] in msg_by_id:
                 replied_to = msg_by_id[msg["reply_to_id"]]
@@ -112,7 +156,14 @@ def build_training_pairs(channels, config):
 
             context_lines = []
             for ctx in context_msgs:
-                ctx_content = clean_content(ctx["content"], user_map, channel_map)
+                ctx_content = clean_context_content(ctx["content"], user_map, channel_map)
+                has_attachment = bool(ctx.get("attachments"))
+
+                if ctx_content and has_attachment:
+                    ctx_content += " [+attachment]"
+                elif has_attachment and not ctx_content:
+                    ctx_content = "[shared media]"
+
                 if ctx_content:
                     prefix = "(replied to) " if replied_to and ctx["id"] == replied_to["id"] else ""
                     context_lines.append(f"{prefix}{ctx['author_name']}: {ctx_content}")
@@ -120,16 +171,21 @@ def build_training_pairs(channels, config):
             if not context_lines:
                 continue
 
-            pairs.append({
+            entry = {
                 "messages": [
-                    {
-                        "role": "system",
-                        "content": "You are Dinner. Reply in character.",
-                    },
+                    {"role": "system", "content": "You are Dinner. Reply in character."},
                     {"role": "user", "content": "\n".join(context_lines)},
                     {"role": "assistant", "content": cleaned},
                 ]
-            })
+            }
+
+            multiplier = recency_multiplier(msg["timestamp"], now, weights)
+            for _ in range(multiplier):
+                pairs.append(entry)
+
+    print(f"  Skipped (URL in response):        {skipped_url}")
+    print(f"  Skipped (attachment in response): {skipped_attachment}")
+    print(f"  Skipped (too short):              {skipped_short}")
 
     return pairs
 
@@ -137,6 +193,7 @@ def build_training_pairs(channels, config):
 def main():
     config = load_config()
     os.makedirs(PROCESSED_DIR, exist_ok=True)
+    now = datetime.now(timezone.utc)
 
     print("Loading raw messages...")
     channels = load_all_messages()
@@ -144,14 +201,13 @@ def main():
     print(f"Loaded {total_msgs} messages from {len(channels)} channels")
 
     print("Building training pairs...")
-    pairs = build_training_pairs(channels, config)
-    print(f"Built {len(pairs)} training pairs")
+    pairs = build_training_pairs(channels, config, now)
+    print(f"Built {len(pairs)} training pairs (after weighting)")
 
     if not pairs:
         print("No training pairs found. Check that dinner_user_id is correct.")
         return
 
-    # Shuffle and split 90/10
     random.seed(42)
     random.shuffle(pairs)
     split = int(len(pairs) * 0.9)
@@ -170,7 +226,6 @@ def main():
     print(f"  Train: {len(train)} pairs -> {train_path}")
     print(f"  Val:   {len(val)} pairs -> {val_path}")
 
-    # Compute average lengths
     ctx_lens = [len(p["messages"][1]["content"]) for p in pairs]
     reply_lens = [len(p["messages"][2]["content"]) for p in pairs]
     print(f"  Avg context length: {sum(ctx_lens) / len(ctx_lens):.0f} chars")

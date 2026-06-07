@@ -1,9 +1,9 @@
 import os
 import random
+import re
 
 import discord
 import yaml
-from llama_cpp import Llama
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(SCRIPT_DIR)
@@ -29,14 +29,32 @@ TOP_P = bot_config.get("top_p", 0.9)
 if not os.path.isabs(MODEL_PATH):
     MODEL_PATH = os.path.join(ROOT_DIR, MODEL_PATH)
 
-print(f"Loading model from {MODEL_PATH}...")
-llm = Llama(
-    model_path=MODEL_PATH,
-    n_ctx=2048,
-    n_gpu_layers=-1,  # offload all layers to GPU
-    verbose=False,
-)
-print("Model loaded!")
+USE_HF = os.path.isdir(MODEL_PATH)
+
+if USE_HF:
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    import torch
+
+    print(f"Loading HF model from {MODEL_PATH}...")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_PATH,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+    )
+    model.eval()
+    print("Model loaded!")
+else:
+    from llama_cpp import Llama
+
+    print(f"Loading GGUF model from {MODEL_PATH}...")
+    llm = Llama(
+        model_path=MODEL_PATH,
+        n_ctx=2048,
+        n_gpu_layers=-1,
+        verbose=False,
+    )
+    print("Model loaded!")
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -44,7 +62,6 @@ client = discord.Client(intents=intents)
 
 
 def build_prompt(context_messages, replied_to_id=None):
-    """Format channel context the same way as training data."""
     lines = []
     for msg in context_messages:
         if msg.content.strip():
@@ -58,14 +75,36 @@ def generate_reply(context_text):
         {"role": "system", "content": "You are Dinner. Reply in character."},
         {"role": "user", "content": context_text},
     ]
-    response = llm.create_chat_completion(
-        messages=messages,
-        max_tokens=MAX_TOKENS,
-        temperature=TEMPERATURE,
-        top_p=TOP_P,
-        stop=["\n\n"],
-    )
-    return response["choices"][0]["message"]["content"].strip()
+
+    if USE_HF:
+        inputs = tokenizer.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=True, return_tensors="pt",
+            enable_thinking=False,
+        ).to(model.device)
+        with torch.no_grad():
+            output = model.generate(
+                inputs,
+                max_new_tokens=MAX_TOKENS,
+                temperature=TEMPERATURE,
+                top_p=TOP_P,
+                do_sample=True,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+        reply = tokenizer.decode(output[0][inputs.shape[-1]:], skip_special_tokens=True)
+        reply = re.sub(r"<think>.*?</think>", "", reply, flags=re.DOTALL)
+        reply = re.sub(r"https?://\S+", "", reply)
+        return reply.strip()
+    else:
+        response = llm.create_chat_completion(
+            messages=messages,
+            max_tokens=MAX_TOKENS,
+            temperature=TEMPERATURE,
+            top_p=TOP_P,
+            stop=["\n\n"],
+        )
+        reply = response["choices"][0]["message"]["content"]
+        reply = re.sub(r"https?://\S+", "", reply)
+        return reply.strip()
 
 
 @client.event

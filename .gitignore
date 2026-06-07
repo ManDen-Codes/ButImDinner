@@ -2,6 +2,12 @@
 data/
 *.gguf
 
+# Unsloth runtime cache
+unsloth_compiled_cache/
+
+# Debug/temp files
+out.txt
+
 # Python
 __pycache__/
 *.pyc

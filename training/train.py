@@ -2,8 +2,10 @@ import os
 
 import yaml
 from datasets import load_dataset
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from trl import SFTTrainer, SFTConfig
-from unsloth import FastLanguageModel
+import torch
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(SCRIPT_DIR)
@@ -18,7 +20,8 @@ def load_config():
 def format_chat(example, tokenizer):
     return {
         "text": tokenizer.apply_chat_template(
-            example["messages"], tokenize=False, add_generation_prompt=False
+            example["messages"], tokenize=False, add_generation_prompt=False,
+            enable_thinking=False,
         )
     }
 
@@ -27,24 +30,39 @@ def main():
     config = load_config()
     tc = config.get("training", {})
 
-    base_model = tc.get("base_model", "unsloth/Qwen3.5-4B")
-    max_seq_length = tc.get("max_seq_length", 2048)
+    base_model = tc.get("base_model", "unsloth/Qwen3-4B")
+    max_seq_length = tc.get("max_seq_length", 512)
     lora_rank = tc.get("lora_rank", 64)
     lora_alpha = tc.get("lora_alpha", 128)
-    epochs = tc.get("epochs", 3)
-    batch_size = tc.get("batch_size", 2)
+    epochs = tc.get("epochs", 5)
+    batch_size = tc.get("batch_size", 4)
     grad_accum = tc.get("gradient_accumulation_steps", 4)
     lr = tc.get("learning_rate", 2e-4)
 
     print(f"Loading base model: {base_model}")
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=base_model,
-        max_seq_length=max_seq_length,
+
+    bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=torch.bfloat16,
     )
 
-    model = FastLanguageModel.get_peft_model(
-        model,
+    model = AutoModelForCausalLM.from_pretrained(
+        base_model,
+        quantization_config=bnb_config,
+        device_map="auto",
+        torch_dtype=torch.bfloat16,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(base_model)
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.model_max_length = max_seq_length
+
+    model = prepare_model_for_kbit_training(model)
+
+    lora_config = LoraConfig(
         r=lora_rank,
         lora_alpha=lora_alpha,
         target_modules=[
@@ -53,8 +71,11 @@ def main():
         ],
         lora_dropout=0,
         bias="none",
-        use_gradient_checkpointing="unsloth",
+        task_type="CAUSAL_LM",
     )
+
+    model = get_peft_model(model, lora_config)
+    model.print_trainable_parameters()
 
     train_path = os.path.join(ROOT_DIR, "data", "processed", "train.jsonl")
     val_path = os.path.join(ROOT_DIR, "data", "processed", "val.jsonl")
@@ -73,28 +94,32 @@ def main():
 
     trainer = SFTTrainer(
         model=model,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         train_dataset=dataset["train"],
         eval_dataset=dataset["validation"],
         args=SFTConfig(
             output_dir=output_dir,
+            dataset_text_field="text",
             per_device_train_batch_size=batch_size,
             gradient_accumulation_steps=grad_accum,
             num_train_epochs=epochs,
             learning_rate=lr,
             lr_scheduler_type="cosine",
-            warmup_ratio=0.05,
-            fp16=True,
+            warmup_steps=100,
+            bf16=True,
             logging_steps=10,
             eval_strategy="epoch",
-            save_strategy="epoch",
+            save_strategy="steps",
+            save_steps=150,
             seed=42,
-            max_seq_length=max_seq_length,
         ),
     )
 
     print("Starting training...")
-    trainer.train()
+    has_checkpoint = any(
+        d.startswith("checkpoint-") for d in os.listdir(output_dir)
+    ) if os.path.isdir(output_dir) else False
+    trainer.train(resume_from_checkpoint=has_checkpoint or None)
 
     print(f"Saving LoRA adapter to {output_dir}")
     model.save_pretrained(output_dir)

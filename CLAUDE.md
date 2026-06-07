@@ -9,7 +9,7 @@ scraper → data processing → QLoRA fine-tuning → GGUF export → discord bo
 ```
 
 **Stack**: Python, discord.py, Unsloth (fine-tuning), llama-cpp-python (inference)
-**Base model**: Qwen3.5 4B (`unsloth/Qwen3.5-4B`, no HF license gate)
+**Base model**: Qwen3 4B (`unsloth/Qwen3-4B`, no HF license gate — Qwen3.5 avoided due to VL processor issues in Unsloth)
 **Training machine**: RTX 4070 Ti (12GB VRAM), QLoRA 4-bit
 **Inference machine**: ASUS laptop — Intel Core Ultra 285H, Intel Arc 140T iGPU, 32GB RAM — runs GGUF via llama-cpp-python (Vulkan backend preferred, CPU fallback works fine; Q4_K_M ~2.5GB)
 
