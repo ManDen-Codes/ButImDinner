@@ -9,20 +9,20 @@ scraper → data processing → QLoRA fine-tuning → GGUF export → discord bo
 ```
 
 - **Scraper**: logs in as a Discord bot and exports all messages from a server
-- **Processor**: converts raw logs into ChatML training pairs (context → Dinner's reply)
-- **Training**: QLoRA fine-tunes Qwen3.5 4B on your GPU using Unsloth
-- **Export**: merges the LoRA adapter and quantizes to GGUF (Q4_K_M, ~2.5GB)
-- **Bot**: runs the GGUF locally and randomly replies in character
+- **Processor**: converts raw logs into ChatML training pairs with recency weighting and quality filtering
+- **Training**: QLoRA fine-tunes Qwen3 4B on your GPU using pure HuggingFace (transformers + peft + trl)
+- **Export**: merges the LoRA adapter into the base model; optionally converts to GGUF for lightweight inference
+- **Bot**: auto-detects HF or GGUF backend and randomly replies in character
 
 ## Requirements
 
 ### Hardware
 - **Training**: NVIDIA GPU with 8GB+ VRAM (tested on RTX 4070 Ti 12GB)
-- **Inference**: any machine with 4GB+ RAM — CPU-only works, GPU optional
+- **Inference**: any machine with 8GB+ RAM — HF merged model or GGUF, GPU optional
 
 ### Software
 - Python 3.10+
-- CUDA 12.x (training only)
+- CUDA 12.x+ (training only)
 
 ---
 
@@ -33,13 +33,13 @@ scraper → data processing → QLoRA fine-tuning → GGUF export → discord bo
 ```bash
 git clone <repo-url>
 cd ButImDinner
-python -m venv venv
+python -m venv .venv
 
 # Windows
-venv\Scripts\activate
+.venv\Scripts\activate
 
 # macOS / Linux
-source venv/bin/activate
+source .venv/bin/activate
 ```
 
 ### 2. Configure
@@ -70,7 +70,7 @@ Run the scraper:
 python scraper/scrape.py
 ```
 
-This exports all messages from the server to `data/raw/` as JSON files (one per channel). The bot needs **Read Message History** permission in each channel.
+Exports all messages from the server to `data/raw/` as JSON files (one per channel). The bot needs **Read Message History** permission in each channel. Scraping can be interrupted and resumed — already-scraped channels are skipped.
 
 ---
 
@@ -82,23 +82,34 @@ No new dependencies needed.
 python scraper/process.py
 ```
 
-Reads `data/raw/`, builds training pairs for every message the target user sent, and writes:
+Reads `data/raw/`, builds training pairs, and writes:
 - `data/processed/train.jsonl` (90%)
 - `data/processed/val.jsonl` (10%)
 
-Each example is a ChatML conversation: the preceding chat context as the user turn, and the target's reply as the assistant turn. Reply context (`(replied to)`) is handled automatically.
+Each example is a ChatML conversation: the preceding chat context as the user turn, the target's reply as the assistant turn.
+
+**Quality filters applied:**
+- Responses containing URLs are dropped (prevents the model learning to generate fake links)
+- Responses with attachments (images, GIFs) are dropped
+- Responses shorter than 3 characters are dropped
+- URLs in context messages are replaced with `[link]`
+
+**Recency weighting** duplicates recent messages so the model reflects current behavior more than old messages. Configurable in `config.yaml` under `recency_weights`.
 
 ---
 
 ## Step 3 — Train
 
-Install dependencies (GPU machine):
+Install dependencies on the GPU machine:
 
 ```bash
-pip install "unsloth[cu124-torch260]" transformers datasets trl bitsandbytes pyyaml
+pip install torch --index-url https://download.pytorch.org/whl/cu130 --force-reinstall
+pip install datasets transformers peft trl==0.24.0 bitsandbytes pyyaml
+pip uninstall torchvision -y
 ```
 
-> Adjust the `unsloth` extra to match your CUDA version. See [Unsloth installation docs](https://unsloth.ai/docs/get-started/installing-unsloth) for options.
+> Adjust the cu130 index to match your CUDA version (cu124, cu126, etc.)
+> Pin trl to 0.24.0 — newer versions have a Windows bug reading Jinja templates
 
 Run training:
 
@@ -106,64 +117,90 @@ Run training:
 python training/train.py
 ```
 
-This downloads Qwen3.5 4B (~2.5GB from HuggingFace, no account required), applies QLoRA, and trains for 3 epochs. The LoRA adapter is saved to `data/model/lora_adapter/`.
+Downloads Qwen3 4B (~8GB from HuggingFace, no account required), applies QLoRA 4-bit, and trains for 5 epochs. Checkpoints are saved every 150 steps — if interrupted, training resumes automatically from the latest checkpoint.
 
-Training config can be adjusted in `config.yaml` under the `training:` key:
+Training config in `config.yaml` under `training:`:
 
 | Key | Default | Notes |
 |-----|---------|-------|
-| `base_model` | `unsloth/Qwen3.5-4B` | HuggingFace model ID |
-| `epochs` | `3` | increase for more data |
-| `batch_size` | `2` | lower if OOM |
+| `base_model` | `unsloth/Qwen3-4B` | HuggingFace model ID |
+| `epochs` | `5` | |
+| `batch_size` | `4` | lower if OOM |
 | `gradient_accumulation_steps` | `4` | effective batch = batch × accum |
 | `learning_rate` | `0.0002` | |
 | `lora_rank` | `64` | |
-| `max_seq_length` | `2048` | |
+| `max_seq_length` | `512` | |
 
 ---
 
-## Step 4 — Export to GGUF
+## Step 4 — Export
 
-No new dependencies needed (uses the same training environment).
+No new dependencies needed.
 
 ```bash
 python training/export.py
 ```
 
-Merges the LoRA adapter into the base model and exports a Q4_K_M GGUF to `data/model/dinner.gguf`.
+Merges the LoRA adapter into the base model and saves the full merged model to `data/model/merged/`. This is usable directly by the bot.
+
+**Optional: convert to GGUF** for lighter inference (needed for llama-cpp-python backend):
+
+```bash
+git clone https://github.com/ggerganov/llama.cpp
+pip install -r llama.cpp/requirements.txt
+python llama.cpp/convert_hf_to_gguf.py data/model/merged --outfile data/model/dinner_f16.gguf --outtype f16
+```
+
+Then quantize (download prebuilt llama.cpp binary from [releases](https://github.com/ggerganov/llama.cpp/releases)):
+
+```bash
+# Q8_0 — near-lossless, ~4.5GB
+llama-quantize.exe data/model/dinner_f16.gguf data/model/dinner.gguf Q8_0
+
+# Q4_K_M — smaller, ~2.5GB
+llama-quantize.exe data/model/dinner_f16.gguf data/model/dinner.gguf Q4_K_M
+```
 
 ---
 
 ## Step 5 — Run the bot
 
-Install dependencies (inference machine):
+The bot auto-detects which backend to use based on `model_path` in `config.yaml`:
+- **Directory** (e.g. `data/model/merged`) → HuggingFace transformers (requires GPU with 8GB+ VRAM)
+- **`.gguf` file** (e.g. `data/model/dinner.gguf`) → llama-cpp-python
+
+### On the training machine (HF backend)
 
 ```bash
-pip install discord.py pyyaml llama-cpp-python
+pip install discord.py pyyaml
 ```
 
-For GPU acceleration on the inference machine, install llama-cpp-python with the appropriate backend:
-
-```bash
-# NVIDIA (CUDA)
-CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python
-
-# Intel Arc / integrated GPU (Vulkan)
-CMAKE_ARGS="-DGGML_VULKAN=on" pip install llama-cpp-python
-
-# CPU only (no extra args needed)
-pip install llama-cpp-python
-```
-
-> On Windows, prebuilt wheels are available at [abetlen/llama-cpp-python releases](https://github.com/abetlen/llama-cpp-python/releases) if you want to avoid compiling.
-
-Transfer `data/model/dinner.gguf` and `config.yaml` to the inference machine, then:
+Set `model_path: "data/model/merged"` in config.yaml, then:
 
 ```bash
 python bot/bot.py
 ```
 
-The bot will load the model and start listening. It replies randomly based on `reply_chance` in `config.yaml` (default 0.01%).
+### On a separate inference machine (GGUF + llama-cpp-python)
+
+Install llama-cpp-python using a prebuilt wheel from [abetlen/llama-cpp-python releases](https://github.com/abetlen/llama-cpp-python/releases). Pick the wheel matching your hardware:
+
+| Hardware | Release tag |
+|----------|-------------|
+| NVIDIA GPU | `cu132`, `cu126`, `cu124` etc. (match your CUDA version) |
+| Intel Arc / Vulkan | `vulkan` |
+| CPU only | base release (no tag) |
+
+```bash
+pip install discord.py pyyaml
+pip install "https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.26-vulkan/llama_cpp_python-0.3.26-py3-none-win_amd64.whl"
+```
+
+Transfer `data/model/dinner.gguf` and `config.yaml` to the inference machine. Set `model_path: "data/model/dinner.gguf"` in config.yaml, then:
+
+```bash
+python bot/bot.py
+```
 
 ---
 
@@ -171,11 +208,13 @@ The bot will load the model and start listening. It replies randomly based on `r
 
 ```
 data/
-  raw/          # scraped channel JSONs (one per channel)
-  processed/    # train.jsonl + val.jsonl
+  raw/              # scraped channel JSONs (one per channel)
+  processed/        # train.jsonl + val.jsonl
   model/
-    lora_adapter/   # saved after training
-    dinner.gguf     # final inference model
+    lora_adapter/   # LoRA checkpoints saved during training
+    merged/         # full merged HF model (used by HF backend)
+    dinner_f16.gguf # full precision GGUF (intermediate)
+    dinner.gguf     # quantized GGUF (used by llama-cpp-python backend)
 ```
 
 `data/` is gitignored — transfer it manually between machines.
@@ -184,7 +223,8 @@ data/
 
 ## Notes
 
-- The Discord bot account used for scraping needs access to all channels you want to include
-- More messages from the target user = better impersonation — aim for 10k+ examples
-- `reply_chance` in config controls how often the bot speaks; tune to taste
-- The bot sends replies using Discord's reply feature so it's clear which message it's responding to
+- The Discord bot account needs **Read Message History** in all channels you want scraped
+- More messages from the target user = better impersonation
+- `reply_chance` in config controls how often the bot speaks (default 0.01% — raise to 5–20% for testing)
+- The bot replies using Discord's reply feature so it's clear which message triggered it
+- Qwen3's built-in chain-of-thought (`<think>` tags) is disabled at both training and inference time
