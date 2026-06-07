@@ -25,6 +25,7 @@ CONTEXT_MESSAGES = bot_config.get("context_messages", 10)
 MAX_TOKENS = bot_config.get("max_response_tokens", 256)
 TEMPERATURE = bot_config.get("temperature", 0.8)
 TOP_P = bot_config.get("top_p", 0.9)
+BOT_MENTION_NAME = bot_config.get("mention_name", "dinner")
 
 if not os.path.isabs(MODEL_PATH):
     MODEL_PATH = os.path.join(ROOT_DIR, MODEL_PATH)
@@ -53,7 +54,6 @@ else:
         n_ctx=2048,
         n_gpu_layers=-1,
         verbose=False,
-        chat_format="chatml",
     )
     print("Model loaded!")
 
@@ -62,18 +62,36 @@ intents.message_content = True
 client = discord.Client(intents=intents)
 
 
+def strip_thinking(text):
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<think>.*", "", text, flags=re.DOTALL)
+    return text.strip()
+
+
+def clean_mentions(msg):
+    text = msg.content.strip()
+    for user in msg.mentions:
+        name = BOT_MENTION_NAME if BOT_MENTION_NAME and user.id == client.user.id else user.name
+        text = re.sub(rf"<@!?{user.id}>", f"@{name}", text)
+    return text
+
+
 def build_prompt(context_messages, replied_to_id=None):
     lines = []
     for msg in context_messages:
         if msg.content.strip():
             prefix = "(replied to) " if replied_to_id and msg.id == replied_to_id else ""
-            lines.append(f"{prefix}{msg.author.display_name}: {msg.content.strip()}")
+            content = clean_mentions(msg)
+            lines.append(f"{prefix}{msg.author.display_name}: {content}")
     return "\n".join(lines)
+
+
+SYSTEM_PROMPT = "You are Dinner. Reply in character."
 
 
 def generate_reply(context_text):
     messages = [
-        {"role": "system", "content": "You are Dinner. Reply in character."},
+        {"role": "system", "content": SYSTEM_PROMPT + (" /no_think" if not USE_HF else "")},
         {"role": "user", "content": context_text},
     ]
 
@@ -92,7 +110,7 @@ def generate_reply(context_text):
                 pad_token_id=tokenizer.eos_token_id,
             )
         reply = tokenizer.decode(output[0][inputs.shape[-1]:], skip_special_tokens=True)
-        reply = re.sub(r"<think>.*?</think>", "", reply, flags=re.DOTALL)
+        reply = strip_thinking(reply)
         reply = re.sub(r"https?://\S+", "", reply)
         return reply.strip()
     else:
@@ -101,10 +119,9 @@ def generate_reply(context_text):
             max_tokens=MAX_TOKENS,
             temperature=TEMPERATURE,
             top_p=TOP_P,
-            stop=["\n\n"],
         )
         reply = response["choices"][0]["message"]["content"]
-        reply = re.sub(r"<think>.*?</think>", "", reply, flags=re.DOTALL)
+        reply = strip_thinking(reply)
         reply = re.sub(r"https?://\S+", "", reply)
         return reply.strip()
 
@@ -120,9 +137,10 @@ async def on_ready():
 async def on_message(message):
     if message.author == client.user:
         return
-    if message.channel.id not in ALLOWED_CHANNELS:
+    mentioned = client.user in message.mentions
+    if not mentioned and message.channel.id not in ALLOWED_CHANNELS:
         return
-    if random.random() > REPLY_CHANCE:
+    if not mentioned and random.random() > REPLY_CHANCE:
         return
 
     history = []
@@ -148,7 +166,7 @@ async def on_message(message):
         reply = generate_reply(context_text)
 
     if reply:
-        print(f"[#{message.channel.name}] {message.author.display_name}: {message.content[:80]}")
+        print(f"[#{message.channel.name}] {message.author.display_name}: {clean_mentions(message)[:80]}")
         print(f"  -> {reply[:120]}")
         await message.reply(reply, mention_author=False)
 
