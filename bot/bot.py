@@ -148,6 +148,8 @@ async def on_message(message):
         reply = generate_reply(context_text)
 
     if reply:
+        print(f"[#{message.channel.name}] {message.author.display_name}: {message.content[:80]}")
+        print(f"  -> {reply[:120]}")
         await message.reply(reply, mention_author=False)
 
 
