@@ -12,7 +12,7 @@ scraper → data processing → QLoRA fine-tuning → GGUF export → discord bo
 - **Processor**: converts raw logs into ChatML training pairs with recency weighting and quality filtering
 - **Training**: QLoRA fine-tunes Qwen3 4B on your GPU using pure HuggingFace (transformers + peft + trl)
 - **Export**: merges the LoRA adapter into the base model; optionally converts to GGUF for lightweight inference
-- **Bot**: auto-detects HF or GGUF backend and randomly replies in character
+- **Bot**: auto-detects HF or GGUF backend, randomly replies in character, resolves @mentions in both input and output
 
 ## Requirements
 
@@ -53,6 +53,8 @@ Edit `config.yaml` and fill in:
 - `guild_id` — the server ID to scrape (right-click server → Copy Server ID with developer mode on)
 - `dinner_user_id` — the target user's Discord ID (right-click user → Copy User ID)
 - `bot.allowed_channels` — list of channel IDs the bot is allowed to reply in
+- `bot.reply_on_mention` — always reply when @mentioned (default: `true`)
+- `bot.mention_name` — name to replace bot's @mention with in model input (default: `"dinner"`)
 
 ---
 
@@ -224,7 +226,12 @@ data/
 ## Notes
 
 - The Discord bot account needs **Read Message History** in all channels you want scraped
+- Enable **Message Content Intent** and **Server Members Intent** in the [Discord Developer Portal](https://discord.com/developers/applications) (Bot settings)
 - More messages from the target user = better impersonation
 - `reply_chance` in config controls how often the bot speaks (default 0.01% — raise to 5–20% for testing)
+- The bot always replies when someone replies to one of its messages
+- Set `reply_on_mention: true` to also always reply when @mentioned
+- `mention_name` controls what the bot's @mention is replaced with in model input (default: `"dinner"`)
+- If the model outputs `@name`, it's resolved against guild members and converted to a real Discord mention; `@everyone`/`@here` pings are blocked
 - The bot replies using Discord's reply feature so it's clear which message triggered it
 - Qwen3's built-in chain-of-thought (`<think>` tags) is disabled at both training and inference time

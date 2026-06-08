@@ -33,17 +33,20 @@ scraper → data processing → QLoRA fine-tuning → GGUF export → discord bo
 ## Current Status
 
 - Training complete (5 epochs, ~29k pairs after filtering and recency weighting)
-- Bot running and tested on training machine (RTX 4070 Ti) using HF backend
-- Next: port to ASUS laptop using GGUF + Vulkan backend
+- Bot running on both machines: RTX 4070 Ti (HF backend) and ASUS laptop (GGUF + Vulkan backend)
 
 ## Key Details
 
 - `data/` is gitignored — transfer it between machines manually
 - **Unsloth was abandoned** — TRL 0.24.0 incompatibility with `<EOS_TOKEN>` placeholder; pure HF stack used instead
 - **Import order**: `import torch` must be LAST import in train.py or `datasets` crashes silently on Windows
-- **Thinking mode**: Qwen3 has built-in chain-of-thought (`<think>` tags); disabled via `enable_thinking=False` in both training format and inference
+- **Thinking mode**: Qwen3 has built-in chain-of-thought (`<think>` tags); disabled via `enable_thinking=False` (HF) and `/no_think` in system prompt (GGUF); `strip_thinking()` removes any leaked `<think>` blocks from output
 - **Bot backend auto-detection**: `model_path` in config — if directory → HF transformers; if `.gguf` file → llama-cpp-python
 - **Data processing filters**: URL-containing responses dropped, attachment-only responses dropped, responses < 3 chars dropped; URLs in context replaced with `[link]`; recency weighting duplicates recent messages (configurable in `recency_weights` config)
+- **Mention handling**: `@mentions` in input are resolved to readable names (bot's own mention → configurable `mention_name`, others → username); bot's own messages in context labeled as `you:` so the model knows which are its own
+- **Reply triggers**: always replies when someone replies to its message; optionally always replies on @mention (`reply_on_mention` config); otherwise rolls `reply_chance` in allowed channels
+- **Output mention resolution**: if the model outputs `@name`, it's matched against guild members (username and nickname) and converted to a real Discord mention; `@everyone`/`@here` pings are suppressed
+- **Discord intents**: requires `message_content` and `members` intents enabled in Discord Developer Portal
 - Config is in `config.yaml` (gitignored) — copy from `config.example.yaml`
 - Zero-cost solution: all open-source, runs fully local, no API calls
 
