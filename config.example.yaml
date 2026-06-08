@@ -53,6 +53,9 @@ bot:
   max_response_tokens: 256
   # Always reply when @mentioned (true/false)
   reply_on_mention: false
+  # Decay rate for reply chains — probability of replying = decay^(bot_replies_in_chain)
+  # 0.5 = 50% after 1st reply, 25% after 2nd, 12.5% after 3rd, etc.
+  reply_chain_decay: 0.65
   # Name to replace bot's @mention with in model input
   mention_name: "dinner"
   # Generation parameters

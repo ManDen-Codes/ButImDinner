@@ -27,6 +27,7 @@ TEMPERATURE = bot_config.get("temperature", 0.8)
 TOP_P = bot_config.get("top_p", 0.9)
 BOT_MENTION_NAME = bot_config.get("mention_name", "dinner")
 REPLY_ON_MENTION = bot_config.get("reply_on_mention", True)
+REPLY_CHAIN_DECAY = bot_config.get("reply_chain_decay", 0.5)
 
 if not os.path.isabs(MODEL_PATH):
     MODEL_PATH = os.path.join(ROOT_DIR, MODEL_PATH)
@@ -136,6 +137,20 @@ async def on_ready():
     print(f"Allowed channels: {ALLOWED_CHANNELS}")
 
 
+async def get_reply_chain_depth(message):
+    depth = 0
+    current = message
+    while current.reference and current.reference.message_id:
+        try:
+            ref = current.reference.cached_message or await current.channel.fetch_message(current.reference.message_id)
+        except (discord.NotFound, discord.HTTPException):
+            break
+        if ref.author == client.user:
+            depth += 1
+        current = ref
+    return depth
+
+
 @client.event
 async def on_message(message):
     if message.author == client.user:
@@ -149,7 +164,11 @@ async def on_message(message):
     forced = mentioned or replied_to_bot
     if not forced and message.channel.id not in ALLOWED_CHANNELS:
         return
-    if not forced and random.random() > REPLY_CHANCE:
+    if forced and not mentioned:
+        depth = await get_reply_chain_depth(message)
+        if depth > 0 and random.random() > REPLY_CHAIN_DECAY ** depth:
+            return
+    elif not forced and random.random() > REPLY_CHANCE:
         return
 
     history = []
