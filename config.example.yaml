@@ -58,6 +58,12 @@ bot:
   reply_chain_decay: 0.65
   # Name to replace bot's @mention with in model input
   mention_name: "dinner"
+  # Chance of reacting to any message with an emoji (0.001 = 0.1%)
+  reaction_chance: 0.05
+  # Maximum tokens for reaction generation (emoji names are short)
+  max_reaction_tokens: 16
+  # Temperature for reaction generation (slightly higher for variety)
+  reaction_temperature: 1.0
   # Generation parameters
   temperature: 0.8
   top_p: 0.9

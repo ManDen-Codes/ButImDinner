@@ -44,7 +44,8 @@ scraper → data processing → QLoRA fine-tuning → GGUF export → discord bo
 - **Bot backend auto-detection**: `model_path` in config — if directory → HF transformers; if `.gguf` file → llama-cpp-python
 - **Data processing filters**: URL-containing responses dropped, attachment-only responses dropped, responses < 3 chars dropped; URLs in context replaced with `[link]`; recency weighting duplicates recent messages (configurable in `recency_weights` config)
 - **Mention handling**: `@mentions` in input are resolved to readable names (bot's own mention → configurable `mention_name`, others → username); bot's own messages in context labeled as `you:` so the model knows which are its own
-- **Reply triggers**: always replies when someone replies to its message; optionally always replies on @mention (`reply_on_mention` config); otherwise rolls `reply_chance` in allowed channels
+- **Reply triggers**: always replies when someone replies to its message (with `reply_chain_decay` tapering); optionally always replies on @mention (`reply_on_mention` config); otherwise rolls `reply_chance` in allowed channels
+- **Emoji reactions** (GGUF only): independent `reaction_chance` roll in allowed channels; uses a separate LLM call with a GBNF grammar constraint that forces the model to output exactly one emoji (Unicode or server custom `:name:`); grammar is built dynamically per-guild via `build_reaction_grammar()` to include available server emoji names
 - **Output mention resolution**: if the model outputs `@name`, it's matched against guild members (username and nickname) and converted to a real Discord mention; `@everyone`/`@here` pings are suppressed
 - **Discord intents**: requires `message_content` and `members` intents enabled in Discord Developer Portal
 - Config is in `config.yaml` (gitignored) — copy from `config.example.yaml`
