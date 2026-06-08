@@ -184,6 +184,14 @@ async def on_message(message):
                         return member.mention
                 return match.group(0)
             reply = re.sub(r"@(\w+)", resolve_mention, reply)
+
+            def resolve_emoji(match):
+                name = match.group(1)
+                for emoji in guild.emojis:
+                    if emoji.name.lower() == name.lower():
+                        return str(emoji)
+                return match.group(0)
+            reply = re.sub(r":(\w+):", resolve_emoji, reply)
         print(f"[#{message.channel.name}] Context:")
         print(context_text)
         print(f"  -> {reply}")
