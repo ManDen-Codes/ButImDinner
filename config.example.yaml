@@ -51,6 +51,10 @@ bot:
   context_messages: 10
   # Maximum tokens in a generated reply
   max_response_tokens: 256
+  # Always reply when @mentioned (true/false)
+  reply_on_mention: false
+  # Name to replace bot's @mention with in model input
+  mention_name: "dinner"
   # Generation parameters
   temperature: 0.8
   top_p: 0.9

@@ -26,6 +26,7 @@ MAX_TOKENS = bot_config.get("max_response_tokens", 256)
 TEMPERATURE = bot_config.get("temperature", 0.8)
 TOP_P = bot_config.get("top_p", 0.9)
 BOT_MENTION_NAME = bot_config.get("mention_name", "dinner")
+REPLY_ON_MENTION = bot_config.get("reply_on_mention", True)
 
 if not os.path.isabs(MODEL_PATH):
     MODEL_PATH = os.path.join(ROOT_DIR, MODEL_PATH)
@@ -59,6 +60,7 @@ else:
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 client = discord.Client(intents=intents)
 
 
@@ -81,8 +83,9 @@ def build_prompt(context_messages, replied_to_id=None):
     for msg in context_messages:
         if msg.content.strip():
             prefix = "(replied to) " if replied_to_id and msg.id == replied_to_id else ""
+            name = "you" if msg.author == client.user else msg.author.display_name
             content = clean_mentions(msg)
-            lines.append(f"{prefix}{msg.author.display_name}: {content}")
+            lines.append(f"{prefix}{name}: {content}")
     return "\n".join(lines)
 
 
@@ -137,10 +140,16 @@ async def on_ready():
 async def on_message(message):
     if message.author == client.user:
         return
-    mentioned = client.user in message.mentions
-    if not mentioned and message.channel.id not in ALLOWED_CHANNELS:
+    mentioned = REPLY_ON_MENTION and client.user in message.mentions
+    replied_to_bot = (
+        message.reference
+        and message.reference.cached_message
+        and message.reference.cached_message.author == client.user
+    )
+    forced = mentioned or replied_to_bot
+    if not forced and message.channel.id not in ALLOWED_CHANNELS:
         return
-    if not mentioned and random.random() > REPLY_CHANCE:
+    if not forced and random.random() > REPLY_CHANCE:
         return
 
     history = []
@@ -166,9 +175,19 @@ async def on_message(message):
         reply = generate_reply(context_text)
 
     if reply:
-        print(f"[#{message.channel.name}] {message.author.display_name}: {clean_mentions(message)[:80]}")
-        print(f"  -> {reply[:120]}")
-        await message.reply(reply, mention_author=False)
+        guild = message.guild
+        if guild:
+            def resolve_mention(match):
+                name = match.group(1).lower()
+                for member in guild.members:
+                    if member.name.lower() == name or (member.nick and member.nick.lower() == name):
+                        return member.mention
+                return match.group(0)
+            reply = re.sub(r"@(\w+)", resolve_mention, reply)
+        print(f"[#{message.channel.name}] Context:")
+        print(context_text)
+        print(f"  -> {reply}")
+        await message.reply(reply, mention_author=False, allowed_mentions=discord.AllowedMentions(everyone=False))
 
 
 def main():
