@@ -9,7 +9,7 @@ scraper → data processing → QLoRA fine-tuning → GGUF export → discord bo
 ```
 
 **Stack**: Python, discord.py, pure HuggingFace (transformers + peft + trl + bitsandbytes), llama-cpp-python (inference)
-**Base model**: Qwen3 8B (`Qwen/Qwen3-8B`)
+**Base model**: Qwen3.5 9B (`Qwen/Qwen3.5-9B`)
 **Training machine**: RTX 4070 Ti (12GB VRAM), QLoRA 4-bit, bf16
 **Inference machine**: ASUS laptop — Intel Core Ultra 285H, Intel Arc 140T iGPU, 32GB RAM — runs GGUF via llama-cpp-python (Vulkan backend); or any machine with the merged HF model
 

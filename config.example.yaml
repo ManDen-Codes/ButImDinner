@@ -13,6 +13,8 @@ dinner_user_id: 000000000000000000
 scraper:
   # Number of context messages before each Dinner message
   context_window: 10
+  # Only include messages on or before this date (exclude bot-generated messages post-deployment)
+  cutoff_date: "2026-06-06"
 
 # Recency weighting: recent messages are duplicated more times in the training set.
 # Each bucket applies to messages older than the previous but within `months` months.

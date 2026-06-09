@@ -412,6 +412,21 @@ def main():
 
     print("Loading raw messages...")
     channels = load_all_messages()
+
+    cutoff_date_str = config.get("scraper", {}).get("cutoff_date")
+    if cutoff_date_str:
+        cutoff_dt = datetime.fromisoformat(cutoff_date_str).replace(tzinfo=timezone.utc)
+        for ch in list(channels.keys()):
+            before = len(channels[ch])
+            def _ts(m):
+                ts = datetime.fromisoformat(m["timestamp"])
+                return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+            channels[ch] = [m for m in channels[ch] if _ts(m) <= cutoff_dt]
+            after = len(channels[ch])
+            if before != after:
+                print(f"  #{ch}: filtered {before - after} messages after {cutoff_date_str}")
+        print(f"Cutoff date applied: {cutoff_date_str}")
+
     total_msgs = sum(len(m) for m in channels.values())
     print(f"Loaded {total_msgs} messages from {len(channels)} channels")
 

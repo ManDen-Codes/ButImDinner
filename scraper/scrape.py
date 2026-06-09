@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import sys
+from datetime import datetime, timezone
 
 import discord
 import yaml
@@ -18,9 +19,9 @@ def load_config():
         return yaml.safe_load(f)
 
 
-async def scrape_channel(channel, pbar):
+async def scrape_channel(channel, pbar, cutoff_dt=None):
     messages = []
-    async for message in channel.history(limit=None, oldest_first=True):
+    async for message in channel.history(limit=None, oldest_first=True, before=cutoff_dt):
         msg_data = {
             "id": message.id,
             "author_id": message.author.id,
@@ -63,6 +64,12 @@ async def main():
             await client.close()
             return
 
+        cutoff_date_str = config.get("scraper", {}).get("cutoff_date")
+        cutoff_dt = None
+        if cutoff_date_str:
+            cutoff_dt = datetime.fromisoformat(cutoff_date_str).replace(tzinfo=timezone.utc)
+            print(f"Cutoff date: {cutoff_date_str} (messages after this date will be excluded)")
+
         text_channels = [
             ch for ch in guild.channels if isinstance(ch, discord.TextChannel)
         ]
@@ -77,7 +84,7 @@ async def main():
             print(f"\nScraping #{channel.name}...")
             try:
                 with tqdm(desc=f"#{channel.name}", unit=" msgs") as pbar:
-                    messages = await scrape_channel(channel, pbar)
+                    messages = await scrape_channel(channel, pbar, cutoff_dt)
 
                 if messages:
                     out_path = os.path.join(RAW_DIR, f"{channel.id}_{channel.name}.json")
