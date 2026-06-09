@@ -1,6 +1,6 @@
 # ButImDinner
 
-Discord bot that impersonates a friend ("Dinner") by fine-tuning a local LLM on their Discord message history. The bot randomly replies to messages in allowlisted channels.
+Discord bot that impersonates a friend ("Dinner") by fine-tuning a local LLM on their Discord message history. The bot uses a structured action system — the model outputs JSON deciding whether to reply, react, send a GIF, combo, or stay silent.
 
 ## Architecture
 
@@ -8,32 +8,36 @@ Discord bot that impersonates a friend ("Dinner") by fine-tuning a local LLM on 
 scraper → data processing → QLoRA fine-tuning → GGUF export → discord bot (local inference)
 ```
 
-**Stack**: Python, discord.py, pure HuggingFace (transformers + peft + trl + bitsandbytes), llama-cpp-python (inference)
-**Base model**: Qwen3 4B (`unsloth/Qwen3-4B`, no HF license gate)
+**Stack**: Python, discord.py, aiohttp, pure HuggingFace (transformers + peft + trl + bitsandbytes), llama-cpp-python (inference)
+**Base model**: Qwen3 8B (`Qwen/Qwen3-8B`)
 **Training machine**: RTX 4070 Ti (12GB VRAM), QLoRA 4-bit, bf16
 **Inference machine**: ASUS laptop — Intel Core Ultra 285H, Intel Arc 140T iGPU, 32GB RAM — runs GGUF via llama-cpp-python (Vulkan backend); or any machine with the merged HF model
 
 ## Project Structure
 
 - `config.example.yaml` — template config (copy to `config.yaml` and fill in)
-- `scraper/scrape.py` — connects as Discord bot, exports all messages from a server to `data/raw/`
-- `scraper/process.py` — converts raw messages into ChatML-style training pairs (JSONL) in `data/processed/`
-- `training/train.py` — QLoRA fine-tune Qwen3 4B using pure HuggingFace stack
+- `scraper/scrape.py` — connects as Discord bot, exports all messages from a server to `data/raw/` (includes reaction metadata)
+- `scraper/scrape_reactions.py` — second-pass scraper that fetches reaction user IDs for messages with reactions
+- `scraper/process.py` — v1 processor: converts raw messages into plain text ChatML training pairs
+- `scraper/process_v2.py` — v2 processor: generates action-labeled JSON training pairs (reply, react, gif, reply_react, none)
+- `training/train.py` — QLoRA fine-tune using pure HuggingFace stack
 - `training/export.py` — merges LoRA adapter into base model, saves to `data/model/merged/`
-- `bot/bot.py` — Discord bot; auto-detects backend (HF if model_path is a directory, GGUF if .gguf file)
+- `bot/bot.py` — Discord bot with unified action system; auto-detects backend (HF if model_path is a directory, GGUF if .gguf file)
 
 ## Workflow
 
 1. `python scraper/scrape.py` — scrape messages (needs `config.yaml` with bot token, guild ID, Dinner's user ID)
-2. `python scraper/process.py` — build training pairs from raw data
-3. `python training/train.py` — fine-tune (run on GPU machine); resumes automatically from latest checkpoint
-4. `python training/export.py` — merge LoRA into base model → `data/model/merged/`; optionally convert to GGUF with llama.cpp
-5. `python bot/bot.py` — run the bot
+2. `python scraper/scrape_reactions.py` — fetch reaction user IDs (second pass, only messages with reactions)
+3. `python scraper/process_v2.py` — build action-labeled training pairs from raw data
+4. `python training/train.py` — fine-tune (run on GPU machine); resumes automatically from latest checkpoint
+5. `python training/export.py` — merge LoRA into base model → `data/model/merged/`; optionally convert to GGUF with llama.cpp
+6. `python bot/bot.py` — run the bot
 
 ## Current Status
 
-- Training complete (5 epochs, ~29k pairs after filtering and recency weighting)
-- Bot running on both machines: RTX 4070 Ti (HF backend) and ASUS laptop (GGUF + Vulkan backend)
+- v1 training complete (Qwen3 4B, 5 epochs, ~29k pairs — plain text replies only)
+- v2 code complete — action system (reply, react, gif, reply_react, none) with Tenor GIF integration
+- v2 needs: re-scrape with reactions, run process_v2.py, train Qwen3 8B, export, deploy
 
 ## Key Details
 
@@ -42,14 +46,17 @@ scraper → data processing → QLoRA fine-tuning → GGUF export → discord bo
 - **Import order**: `import torch` must be LAST import in train.py or `datasets` crashes silently on Windows
 - **Thinking mode**: Qwen3 has built-in chain-of-thought (`<think>` tags); disabled via `enable_thinking=False` (HF) and `/no_think` in system prompt (GGUF); `strip_thinking()` removes any leaked `<think>` blocks from output
 - **Bot backend auto-detection**: `model_path` in config — if directory → HF transformers; if `.gguf` file → llama-cpp-python
-- **Data processing filters**: URL-containing responses dropped, attachment-only responses dropped, responses < 3 chars dropped; URLs in context replaced with `[link]`; recency weighting duplicates recent messages (configurable in `recency_weights` config)
-- **Mention handling**: `@mentions` in input are resolved to readable names (bot's own mention → configurable `mention_name`, others → username); bot's own messages in context labeled as `you:` so the model knows which are its own
-- **Reply triggers**: always replies when someone replies to its message (with `reply_chain_decay` tapering); optionally always replies on @mention (`reply_on_mention` config); otherwise rolls `reply_chance` in allowed channels
-- **Emoji reactions** (GGUF only): independent `reaction_chance` roll in allowed channels; uses a separate LLM call with a GBNF grammar constraint that forces the model to output exactly one emoji (Unicode or server custom `:name:`); grammar is built dynamically per-guild via `build_reaction_grammar()` to include available server emoji names
+- **v2 action system**: model outputs JSON with action type (reply, react, gif, reply_react, none) — single model call decides what to do; bot dispatches accordingly
+- **v2 data labeling**: `process_v2.py` generates action-labeled training pairs; GIF queries extracted from Tenor URL slugs; "none" actions sampled from messages Dinner ignored; `mentions` field extracted from `<@id>` patterns
+- **Data processing filters**: URL-containing responses dropped, attachment-only responses dropped, responses < 3 chars dropped; URLs in context replaced with `[link]`; recency weighting duplicates recent messages (configurable in `recency_weights` config); GIF oversampling configurable via `gif_oversample`
+- **Mention handling**: `@mentions` in input are resolved to readable names (bot's own mention → configurable `mention_name`, others → username); bot's own messages in context labeled as `you:` so the model knows which are its own; output `mentions` field resolved to real Discord mentions
+- **Engagement triggers**: always engages when someone replies to its message (with `reply_chain_decay` tapering); optionally always engages on @mention (`reply_on_mention` config); otherwise rolls `engagement_chance` in allowed channels — model decides the action type
+- **GBNF grammar**: constrains GGUF output to valid JSON matching the action schema; grammar built dynamically per-guild to include server custom emoji names; cached and rebuilt on emoji changes
+- **Tenor GIF integration**: `gif` action triggers Tenor API v2 search; picks random from top 3 results; requires `tenor_api_key` in config
 - **Output mention resolution**: if the model outputs `@name`, it's matched against guild members (username and nickname) and converted to a real Discord mention; `@everyone`/`@here` pings are suppressed
 - **Discord intents**: requires `message_content` and `members` intents enabled in Discord Developer Portal
 - Config is in `config.yaml` (gitignored) — copy from `config.example.yaml`
-- Zero-cost solution: all open-source, runs fully local, no API calls
+- Zero-cost solution: all open-source, runs fully local, no paid API calls (Tenor API is free tier)
 
 ## Training Dependencies (GPU machine)
 
@@ -65,12 +72,12 @@ Note: `trl` must be pinned to `0.24.0` — newer versions have a Windows Unicode
 
 **On training machine (HF backend, no GGUF needed):**
 ```
-pip install discord.py pyyaml transformers torch accelerate
+pip install discord.py pyyaml aiohttp transformers torch accelerate
 ```
 
 **On laptop (GGUF + Vulkan backend):**
 ```
-pip install discord.py pyyaml
+pip install discord.py pyyaml aiohttp
 pip install <vulkan wheel from https://github.com/abetlen/llama-cpp-python/releases>
 ```
 Download the `llama_cpp_python-*-py3-none-win_amd64.whl` from the `vulkan` release tag.

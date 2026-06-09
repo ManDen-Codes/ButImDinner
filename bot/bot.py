@@ -1,7 +1,9 @@
+import json
 import os
 import random
 import re
 
+import aiohttp
 import discord
 import yaml
 
@@ -18,7 +20,7 @@ def load_config():
 config = load_config()
 bot_config = config.get("bot", {})
 
-REPLY_CHANCE = bot_config.get("reply_chance", 0.0001)
+ENGAGEMENT_CHANCE = bot_config.get("engagement_chance", 0.05)
 ALLOWED_CHANNELS = set(bot_config.get("allowed_channels", []))
 MODEL_PATH = bot_config.get("model_path", "data/model/dinner.gguf")
 CONTEXT_MESSAGES = bot_config.get("context_messages", 10)
@@ -28,9 +30,7 @@ TOP_P = bot_config.get("top_p", 0.9)
 BOT_MENTION_NAME = bot_config.get("mention_name", "dinner")
 REPLY_ON_MENTION = bot_config.get("reply_on_mention", True)
 REPLY_CHAIN_DECAY = bot_config.get("reply_chain_decay", 0.5)
-REACTION_CHANCE = bot_config.get("reaction_chance", 0.001)
-MAX_REACTION_TOKENS = bot_config.get("max_reaction_tokens", 16)
-REACTION_TEMPERATURE = bot_config.get("reaction_temperature", 1.0)
+TENOR_API_KEY = bot_config.get("tenor_api_key", "")
 
 if not os.path.isabs(MODEL_PATH):
     MODEL_PATH = os.path.join(ROOT_DIR, MODEL_PATH)
@@ -67,6 +67,64 @@ intents.message_content = True
 intents.members = True
 client = discord.Client(intents=intents)
 
+SYSTEM_PROMPT = (
+    "You are Dinner in a Discord server. Given the conversation context, "
+    "decide what to do. Output a JSON action: reply, react, gif, reply_react, "
+    "or none. Reply in character."
+)
+
+UNICODE_EMOJIS = [
+    "\U0001f602", "\U0001f62d", "\U0001f480", "\U0001f525", "❤️",
+    "\U0001f60d", "\U0001f97a", "\U0001f60e", "\U0001f923", "\U0001f624",
+    "\U0001f621", "\U0001f914", "\U0001f60f", "\U0001f970", "\U0001f633",
+    "\U0001f44d", "\U0001f44e", "\U0001f440", "\U0001f64f", "\U0001f4af",
+    "\U0001f5ff", "\U0001f608", "\U0001f921", "\U0001f494", "✨",
+    "\U0001f389", "\U0001f610", "\U0001f611", "\U0001f92e", "\U0001f922",
+    "\U0001f634", "\U0001f92f", "\U0001f972", "\U0001f62e", "\U0001f631",
+    "\U0001fae1", "\U0001fae0", "\U0001f91d", "✅", "❌",
+    "⭐", "\U0001f410", "\U0001f4aa", "\U0001f614", "\U0001f622",
+    "\U0001f644", "\U0001f62c", "\U0001f913", "\U0001f485", "\U0001f47b",
+    "\U0001f3b6", "\U0001f937", "\U0001f441️", "\U0001f9e0", "\U0001f60b",
+    "\U0001f928", "\U0001f60a", "\U0001fae3", "\U0001fae5", "\U0001f44d\U0001f3fb",
+]
+
+# Grammar cache per guild
+_grammar_cache = {}
+
+
+def build_action_grammar(guild=None):
+    guild_id = guild.id if guild else None
+    if guild_id in _grammar_cache:
+        return _grammar_cache[guild_id]
+
+    emoji_alts = " | ".join(f'"{e}"' for e in UNICODE_EMOJIS)
+    if guild and guild.emojis:
+        custom_alts = " | ".join(f'":{e.name}:"' for e in guild.emojis)
+        emoji_rule = f"emoji ::= {emoji_alts} | {custom_alts}"
+    else:
+        emoji_rule = f"emoji ::= {emoji_alts}"
+
+    grammar_str = rf"""root ::= action-reply | action-react | action-none | action-gif | action-reply-react
+
+action-reply ::= "{{\"action\": \"reply\", \"text\": \"" text-content "\", \"mentions\": [" mentions-list "]}}"
+action-react ::= "{{\"action\": \"react\", \"emoji\": \"" emoji "\"}}"
+action-none ::= "{{\"action\": \"none\"}}"
+action-gif ::= "{{\"action\": \"gif\", \"query\": \"" text-content "\"}}"
+action-reply-react ::= "{{\"action\": \"reply_react\", \"text\": \"" text-content "\", \"emoji\": \"" emoji "\", \"mentions\": [" mentions-list "]}}"
+
+mentions-list ::= "" | "\"" mention-name "\"" ("," " \"" mention-name "\"")*
+mention-name ::= [a-zA-Z0-9_]+
+
+text-content ::= text-char+
+text-char ::= [^"\\] | "\\" escape-char
+escape-char ::= ["\\/bfnrt]
+
+{emoji_rule}
+"""
+    grammar = LlamaGrammar.from_string(grammar_str)
+    _grammar_cache[guild_id] = grammar
+    return grammar
+
 
 def strip_thinking(text):
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
@@ -93,10 +151,7 @@ def build_prompt(context_messages, replied_to_id=None):
     return "\n".join(lines)
 
 
-SYSTEM_PROMPT = "You are Dinner. Reply in character."
-
-
-def generate_reply(context_text):
+def generate(context_text, guild=None):
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT + (" /no_think" if not USE_HF else "")},
         {"role": "user", "content": context_text},
@@ -116,62 +171,61 @@ def generate_reply(context_text):
                 do_sample=True,
                 pad_token_id=tokenizer.eos_token_id,
             )
-        reply = tokenizer.decode(output[0][inputs.shape[-1]:], skip_special_tokens=True)
-        reply = strip_thinking(reply)
-        reply = re.sub(r"https?://\S+", "", reply)
-        return reply.strip()
+        raw = tokenizer.decode(output[0][inputs.shape[-1]:], skip_special_tokens=True)
+        return strip_thinking(raw).strip()
     else:
+        grammar = build_action_grammar(guild)
         response = llm.create_chat_completion(
             messages=messages,
             max_tokens=MAX_TOKENS,
             temperature=TEMPERATURE,
             top_p=TOP_P,
+            grammar=grammar,
         )
-        reply = response["choices"][0]["message"]["content"]
-        reply = strip_thinking(reply)
-        reply = re.sub(r"https?://\S+", "", reply)
-        return reply.strip()
+        raw = response["choices"][0]["message"]["content"]
+        return strip_thinking(raw).strip()
 
 
-REACTION_SYSTEM_PROMPT = "Pick one emoji reaction for the last message. Output ONLY the emoji."
-
-UNICODE_EMOJIS = [
-    "😂", "😭", "💀", "🔥", "❤️", "😍", "🥺", "😎", "🤣", "😤",
-    "😡", "🤔", "😏", "🥰", "😳", "👍", "👎", "👀", "🙏", "💯",
-    "🗿", "😈", "🤡", "💔", "✨", "🎉", "😐", "😑", "🤮", "🤢",
-    "😴", "🤯", "🥲", "😮", "😱", "🫡", "🫠", "🤝", "✅", "❌",
-    "⭐", "🐐", "💪", "😔", "😢", "🙄", "😬", "🤓", "💅", "👻",
-    "🎶", "🤷", "👁️", "🧠", "😋", "🤨", "😊", "🫣", "🫵", "👍🏻",
-]
-
-EMOJI_GRAMMAR_BASE = 'unicode-emoji ::= ' + " | ".join(f'"{e}"' for e in UNICODE_EMOJIS)
-
-
-def build_reaction_grammar(guild=None):
-    if guild and guild.emojis:
-        alternatives = " | ".join(f'":{e.name}:"' for e in guild.emojis)
-        return f"root ::= {alternatives}"
-    return "root ::= unicode-emoji\n" + EMOJI_GRAMMAR_BASE
+def parse_action(raw_output):
+    json_match = re.search(r"\{[^{}]*\}", raw_output)
+    if not json_match:
+        return None
+    try:
+        action = json.loads(json_match.group())
+    except json.JSONDecodeError:
+        return None
+    if action.get("action") not in ("reply", "react", "gif", "reply_react", "none"):
+        return None
+    return action
 
 
-def generate_reaction(context_text, guild=None):
-    grammar = LlamaGrammar.from_string(build_reaction_grammar(guild))
+def resolve_output_mentions(text, mention_names, guild):
+    if not guild:
+        return text
 
-    messages = [
-        {"role": "system", "content": REACTION_SYSTEM_PROMPT + " /no_think"},
-        {"role": "user", "content": context_text},
-    ]
+    def resolve_mention(match):
+        name = match.group(1).lower()
+        for member in guild.members:
+            if member.name.lower() == name or (member.nick and member.nick.lower() == name):
+                return member.mention
+        return match.group(0)
 
-    response = llm.create_chat_completion(
-        messages=messages,
-        max_tokens=MAX_REACTION_TOKENS,
-        temperature=REACTION_TEMPERATURE,
-        top_p=TOP_P,
-        grammar=grammar,
-    )
-    result = response["choices"][0]["message"]["content"]
-    result = strip_thinking(result)
-    return result.strip()
+    text = re.sub(r"@(\w+)", resolve_mention, text)
+    return text
+
+
+def resolve_output_emojis(text, guild):
+    if not guild:
+        return text
+
+    def resolve_emoji(match):
+        name = match.group(1)
+        for emoji in guild.emojis:
+            if emoji.name.lower() == name.lower():
+                return str(emoji)
+        return match.group(0)
+
+    return re.sub(r":(\w+):", resolve_emoji, text)
 
 
 def resolve_reaction_emoji(text, guild):
@@ -184,12 +238,84 @@ def resolve_reaction_emoji(text, guild):
     return text
 
 
+async def search_tenor_gif(query, limit=8):
+    if not TENOR_API_KEY:
+        return None
+    params = {
+        "q": query,
+        "key": TENOR_API_KEY,
+        "limit": limit,
+        "media_filter": "gif",
+        "contentfilter": "off",
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://tenor.googleapis.com/v2/search", params=params) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                results = data.get("results", [])
+                if not results:
+                    return None
+                choice = random.choice(results[:min(3, len(results))])
+                return choice.get("url", "")
+    except Exception:
+        return None
+
+
+async def dispatch_action(action, message):
+    action_type = action["action"]
+    guild = message.guild
+    channel_tag = f"[#{message.channel.name}]"
+
+    if action_type == "none":
+        print(f"{channel_tag} Action: none")
+        return
+
+    if action_type in ("reply", "reply_react"):
+        text = action.get("text", "")
+        if text:
+            mention_names = action.get("mentions", [])
+            text = resolve_output_mentions(text, mention_names, guild)
+            text = resolve_output_emojis(text, guild)
+            text = re.sub(r"https?://\S+", "", text).strip()
+            if text:
+                print(f"{channel_tag} Action: {action_type} -> {text}")
+                await message.reply(
+                    text,
+                    mention_author=False,
+                    allowed_mentions=discord.AllowedMentions(everyone=False),
+                )
+
+    if action_type in ("react", "reply_react"):
+        emoji_str = action.get("emoji", "")
+        if emoji_str:
+            emoji = resolve_reaction_emoji(emoji_str, guild)
+            if emoji:
+                print(f"{channel_tag} Action: react -> {emoji}")
+                await message.add_reaction(emoji)
+
+    if action_type == "gif":
+        query = action.get("query", "")
+        if query:
+            gif_url = await search_tenor_gif(query)
+            if gif_url:
+                print(f"{channel_tag} Action: gif ({query!r}) -> {gif_url}")
+                await message.reply(
+                    gif_url,
+                    mention_author=False,
+                    allowed_mentions=discord.AllowedMentions(everyone=False),
+                )
+            else:
+                print(f"{channel_tag} GIF search failed for {query!r}")
+
+
 @client.event
 async def on_ready():
     print(f"Bot online as {client.user}")
-    print(f"Reply chance: {REPLY_CHANCE * 100}%")
-    print(f"Reaction chance: {REACTION_CHANCE * 100}%")
+    print(f"Engagement chance: {ENGAGEMENT_CHANCE * 100}%")
     print(f"Allowed channels: {ALLOWED_CHANNELS}")
+    print(f"Tenor API: {'configured' if TENOR_API_KEY else 'not configured'}")
 
 
 async def get_reply_chain_depth(message):
@@ -223,22 +349,17 @@ async def on_message(message):
     if not forced and not in_allowed_channel:
         return
 
-    should_reply = False
-    should_react = False
-
+    should_engage = False
     if forced:
-        should_reply = True
+        should_engage = True
         if not mentioned:
             depth = await get_reply_chain_depth(message)
             if depth > 0 and random.random() > REPLY_CHAIN_DECAY ** depth:
-                should_reply = False
+                should_engage = False
     else:
-        should_reply = random.random() <= REPLY_CHANCE
+        should_engage = random.random() <= ENGAGEMENT_CHANCE
 
-    if not USE_HF and in_allowed_channel:
-        should_react = random.random() <= REACTION_CHANCE
-
-    if not should_reply and not should_react:
+    if not should_engage:
         return
 
     history = []
@@ -260,49 +381,40 @@ async def on_message(message):
     if not context_text:
         return
 
-    if should_react:
-        try:
-            print(f"[#{message.channel.name}] Generating reaction for: {message.content[:80]!r}")
-            print(f"[#{message.channel.name}] Reaction context:\n{context_text}")
-            reaction_text = generate_reaction(context_text, guild=message.guild)
-            print(f"[#{message.channel.name}] Model output: {reaction_text!r}")
-            if reaction_text:
-                emoji = resolve_reaction_emoji(reaction_text, message.guild)
-                print(f"[#{message.channel.name}] Resolved emoji: {emoji!r} (type: {type(emoji).__name__})")
-                if emoji:
-                    await message.add_reaction(emoji)
-                    print(f"[#{message.channel.name}] Reacted with: {emoji}")
-                else:
-                    print(f"[#{message.channel.name}] Reaction unresolvable: {reaction_text!r}")
-        except Exception as e:
-            print(f"[#{message.channel.name}] Reaction failed: {e}")
+    channel_tag = f"[#{message.channel.name}]"
+    print(f"{channel_tag} Context:\n{context_text}")
 
-    if should_reply:
-        async with message.channel.typing():
-            reply = generate_reply(context_text)
+    async with message.channel.typing():
+        raw_output = generate(context_text, guild=message.guild)
 
-        if reply:
-            guild = message.guild
-            if guild:
-                def resolve_mention(match):
-                    name = match.group(1).lower()
-                    for member in guild.members:
-                        if member.name.lower() == name or (member.nick and member.nick.lower() == name):
-                            return member.mention
-                    return match.group(0)
-                reply = re.sub(r"@(\w+)", resolve_mention, reply)
+    print(f"{channel_tag} Raw output: {raw_output!r}")
+    action = parse_action(raw_output)
 
-                def resolve_emoji(match):
-                    name = match.group(1)
-                    for emoji in guild.emojis:
-                        if emoji.name.lower() == name.lower():
-                            return str(emoji)
-                    return match.group(0)
-                reply = re.sub(r":(\w+):", resolve_emoji, reply)
-            print(f"[#{message.channel.name}] Context:")
-            print(context_text)
-            print(f"  -> {reply}")
-            await message.reply(reply, mention_author=False, allowed_mentions=discord.AllowedMentions(everyone=False))
+    if action is None:
+        if forced:
+            cleaned = re.sub(r"https?://\S+", "", raw_output).strip()
+            if cleaned:
+                print(f"{channel_tag} Fallback plain reply: {cleaned}")
+                await message.reply(
+                    cleaned,
+                    mention_author=False,
+                    allowed_mentions=discord.AllowedMentions(everyone=False),
+                )
+        else:
+            print(f"{channel_tag} Unparseable output, ignoring")
+        return
+
+    try:
+        await dispatch_action(action, message)
+    except discord.HTTPException as e:
+        print(f"{channel_tag} Dispatch failed: {e}")
+    except Exception as e:
+        print(f"{channel_tag} Unexpected error: {e}")
+
+
+@client.event
+async def on_guild_emojis_update(guild, before, after):
+    _grammar_cache.pop(guild.id, None)
 
 
 def main():

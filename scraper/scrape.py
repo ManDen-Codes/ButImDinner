@@ -31,6 +31,10 @@ async def scrape_channel(channel, pbar):
             "channel_name": channel.name,
             "attachments": [a.url for a in message.attachments],
             "reply_to_id": message.reference.message_id if message.reference else None,
+            "reactions_summary": [
+                {"emoji": str(r.emoji), "count": r.count}
+                for r in message.reactions
+            ],
         }
         messages.append(msg_data)
         pbar.update(1)

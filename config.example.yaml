@@ -29,20 +29,26 @@ recency_weights:
 
 # Training settings
 training:
-  base_model: "unsloth/Qwen3-4B"
-  epochs: 5
-  batch_size: 4
-  gradient_accumulation_steps: 4
-  learning_rate: 0.0002
-  max_seq_length: 512
+  base_model: "Qwen/Qwen3-8B"
+  epochs: 3
+  batch_size: 2
+  gradient_accumulation_steps: 8
+  learning_rate: 0.0001
+  max_seq_length: 768
   lora_rank: 64
   lora_alpha: 128
+  # Oversample GIF training pairs (low count in dataset)
+  gif_oversample: 4
+  # Target ratio of "none" actions in dataset (0.35 = 35%)
+  none_ratio: 0.35
   
 # Bot settings
 bot:
-  # Chance of replying to any message (0.0001 = 0.01%)
-  reply_chance: 0.0001
-  # Channel IDs the bot is allowed to reply in
+  # Chance of engaging with any message — model decides what action to take (0.05 = 5%)
+  engagement_chance: 0.05
+  # Tenor API key for GIF search (free from Google Cloud Console)
+  tenor_api_key: ""
+  # Channel IDs the bot is allowed to engage in
   allowed_channels:
     - 000000000000000000
   # Path to the GGUF model file
@@ -58,12 +64,6 @@ bot:
   reply_chain_decay: 0.65
   # Name to replace bot's @mention with in model input
   mention_name: "dinner"
-  # Chance of reacting to any message with an emoji (0.001 = 0.1%)
-  reaction_chance: 0.05
-  # Maximum tokens for reaction generation (emoji names are short)
-  max_reaction_tokens: 16
-  # Temperature for reaction generation (slightly higher for variety)
-  reaction_temperature: 1.0
   # Generation parameters
   temperature: 0.8
   top_p: 0.9
