@@ -191,6 +191,22 @@ def get_dinner_reaction_map(messages, dinner_id):
     return reaction_map
 
 
+def build_gif_index(channels, dinner_id):
+    index = {}
+    for messages in channels.values():
+        for msg in messages:
+            if msg["author_id"] != dinner_id:
+                continue
+            match = TENOR_RE.search(msg["content"])
+            if not match:
+                continue
+            slug = match.group(1)
+            url = match.group(0)
+            words = slug.lower().split("-")
+            index[url] = words
+    return index
+
+
 def build_all_pairs(channels, config, now):
     dinner_id = config["dinner_user_id"]
     context_window = config.get("scraper", {}).get("context_window", 10)
@@ -398,6 +414,13 @@ def main():
     channels = load_all_messages()
     total_msgs = sum(len(m) for m in channels.values())
     print(f"Loaded {total_msgs} messages from {len(channels)} channels")
+
+    print("Building GIF index...")
+    gif_index = build_gif_index(channels, config["dinner_user_id"])
+    gif_index_path = os.path.join(PROCESSED_DIR, "gif_index.json")
+    with open(gif_index_path, "w", encoding="utf-8") as f:
+        json.dump(gif_index, f, ensure_ascii=False, indent=2)
+    print(f"  {len(gif_index)} unique GIFs -> {gif_index_path}")
 
     print("Building v2 training pairs...")
     random.seed(42)

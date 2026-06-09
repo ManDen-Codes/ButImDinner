@@ -3,7 +3,6 @@ import os
 import random
 import re
 
-import aiohttp
 import discord
 import yaml
 
@@ -30,7 +29,6 @@ TOP_P = bot_config.get("top_p", 0.9)
 BOT_MENTION_NAME = bot_config.get("mention_name", "dinner")
 REPLY_ON_MENTION = bot_config.get("reply_on_mention", True)
 REPLY_CHAIN_DECAY = bot_config.get("reply_chain_decay", 0.5)
-TENOR_API_KEY = bot_config.get("tenor_api_key", "")
 
 if not os.path.isabs(MODEL_PATH):
     MODEL_PATH = os.path.join(ROOT_DIR, MODEL_PATH)
@@ -61,6 +59,15 @@ else:
         verbose=False,
     )
     print("Model loaded!")
+
+GIF_INDEX_PATH = os.path.join(ROOT_DIR, "data", "processed", "gif_index.json")
+gif_index = {}
+if os.path.exists(GIF_INDEX_PATH):
+    with open(GIF_INDEX_PATH, encoding="utf-8") as f:
+        gif_index = json.load(f)
+    print(f"Loaded {len(gif_index)} GIFs from index")
+else:
+    print("No GIF index found — gif actions will be skipped")
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -238,29 +245,20 @@ def resolve_reaction_emoji(text, guild):
     return text
 
 
-async def search_tenor_gif(query, limit=8):
-    if not TENOR_API_KEY:
+def search_gif(query):
+    if not gif_index:
         return None
-    params = {
-        "q": query,
-        "key": TENOR_API_KEY,
-        "limit": limit,
-        "media_filter": "gif",
-        "contentfilter": "off",
-    }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get("https://tenor.googleapis.com/v2/search", params=params) as resp:
-                if resp.status != 200:
-                    return None
-                data = await resp.json()
-                results = data.get("results", [])
-                if not results:
-                    return None
-                choice = random.choice(results[:min(3, len(results))])
-                return choice.get("url", "")
-    except Exception:
+    query_words = set(query.lower().split())
+    scored = []
+    for url, slug_words in gif_index.items():
+        overlap = query_words & set(slug_words)
+        if overlap:
+            scored.append((len(overlap), url))
+    if not scored:
         return None
+    scored.sort(key=lambda x: -x[0])
+    top = [url for score, url in scored if score == scored[0][0]]
+    return random.choice(top[:3])
 
 
 async def dispatch_action(action, message):
@@ -298,7 +296,7 @@ async def dispatch_action(action, message):
     if action_type == "gif":
         query = action.get("query", "")
         if query:
-            gif_url = await search_tenor_gif(query)
+            gif_url = search_gif(query)
             if gif_url:
                 print(f"{channel_tag} Action: gif ({query!r}) -> {gif_url}")
                 await message.reply(
@@ -307,7 +305,7 @@ async def dispatch_action(action, message):
                     allowed_mentions=discord.AllowedMentions(everyone=False),
                 )
             else:
-                print(f"{channel_tag} GIF search failed for {query!r}")
+                print(f"{channel_tag} No GIF match for {query!r}")
 
 
 @client.event
@@ -315,7 +313,7 @@ async def on_ready():
     print(f"Bot online as {client.user}")
     print(f"Engagement chance: {ENGAGEMENT_CHANCE * 100}%")
     print(f"Allowed channels: {ALLOWED_CHANNELS}")
-    print(f"Tenor API: {'configured' if TENOR_API_KEY else 'not configured'}")
+    print(f"GIF index: {len(gif_index)} GIFs loaded")
 
 
 async def get_reply_chain_depth(message):

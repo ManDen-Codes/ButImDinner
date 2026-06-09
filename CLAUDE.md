@@ -8,7 +8,7 @@ Discord bot that impersonates a friend ("Dinner") by fine-tuning a local LLM on 
 scraper → data processing → QLoRA fine-tuning → GGUF export → discord bot (local inference)
 ```
 
-**Stack**: Python, discord.py, aiohttp, pure HuggingFace (transformers + peft + trl + bitsandbytes), llama-cpp-python (inference)
+**Stack**: Python, discord.py, pure HuggingFace (transformers + peft + trl + bitsandbytes), llama-cpp-python (inference)
 **Base model**: Qwen3 8B (`Qwen/Qwen3-8B`)
 **Training machine**: RTX 4070 Ti (12GB VRAM), QLoRA 4-bit, bf16
 **Inference machine**: ASUS laptop — Intel Core Ultra 285H, Intel Arc 140T iGPU, 32GB RAM — runs GGUF via llama-cpp-python (Vulkan backend); or any machine with the merged HF model
@@ -52,11 +52,11 @@ scraper → data processing → QLoRA fine-tuning → GGUF export → discord bo
 - **Mention handling**: `@mentions` in input are resolved to readable names (bot's own mention → configurable `mention_name`, others → username); bot's own messages in context labeled as `you:` so the model knows which are its own; output `mentions` field resolved to real Discord mentions
 - **Engagement triggers**: always engages when someone replies to its message (with `reply_chain_decay` tapering); optionally always engages on @mention (`reply_on_mention` config); otherwise rolls `engagement_chance` in allowed channels — model decides the action type
 - **GBNF grammar**: constrains GGUF output to valid JSON matching the action schema; grammar built dynamically per-guild to include server custom emoji names; cached and rebuilt on emoji changes
-- **Tenor GIF integration**: `gif` action triggers Tenor API v2 search; picks random from top 3 results; requires `tenor_api_key` in config
+- **GIF support**: `gif` action matches model's query against Dinner's own GIF history (local index at `data/processed/gif_index.json`, built by `process_v2.py`); no external API needed
 - **Output mention resolution**: if the model outputs `@name`, it's matched against guild members (username and nickname) and converted to a real Discord mention; `@everyone`/`@here` pings are suppressed
 - **Discord intents**: requires `message_content` and `members` intents enabled in Discord Developer Portal
 - Config is in `config.yaml` (gitignored) — copy from `config.example.yaml`
-- Zero-cost solution: all open-source, runs fully local, no paid API calls (Tenor API is free tier)
+- Zero-cost solution: all open-source, runs fully local, no API calls
 
 ## Training Dependencies (GPU machine)
 
@@ -72,12 +72,12 @@ Note: `trl` must be pinned to `0.24.0` — newer versions have a Windows Unicode
 
 **On training machine (HF backend, no GGUF needed):**
 ```
-pip install discord.py pyyaml aiohttp transformers torch accelerate
+pip install discord.py pyyaml transformers torch accelerate
 ```
 
 **On laptop (GGUF + Vulkan backend):**
 ```
-pip install discord.py pyyaml aiohttp
+pip install discord.py pyyaml
 pip install <vulkan wheel from https://github.com/abetlen/llama-cpp-python/releases>
 ```
 Download the `llama_cpp_python-*-py3-none-win_amd64.whl` from the `vulkan` release tag.

@@ -46,8 +46,6 @@ training:
 bot:
   # Chance of engaging with any message — model decides what action to take (0.05 = 5%)
   engagement_chance: 0.05
-  # Tenor API key for GIF search (free from Google Cloud Console)
-  tenor_api_key: ""
   # Channel IDs the bot is allowed to engage in
   allowed_channels:
     - 000000000000000000
