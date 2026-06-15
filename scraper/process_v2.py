@@ -66,10 +66,13 @@ def clean_content(content, user_map, channel_map):
         cid = int(match.group(1))
         return f"#{channel_map.get(cid, 'unknown')}"
 
+    # Role mentions (<@&id>) have no readable name here and must not teach the model
+    # to ping roles; strip them. Must run before the user-mention sub.
+    content = re.sub(r"<@&\d+>", "", content)
     content = re.sub(r"<@!?(\d+)>", replace_user_mention, content)
     content = re.sub(r"<#(\d+)>", replace_channel_mention, content)
     content = re.sub(r"<a?:(\w+):\d+>", r":\1:", content)
-    return content.strip()
+    return re.sub(r"\s{2,}", " ", content).strip()
 
 
 def clean_context_content(content, user_map, channel_map):
@@ -345,7 +348,18 @@ def build_all_pairs(channels, config, now):
                 continue
             none_candidates.append((channel_name, i, msg))
 
-    # Sample none pairs
+    # Cap react-only pairs relative to reply pairs so the model doesn't default to reacting.
+    react_cap_ratio = config.get("training", {}).get("react_cap_ratio", 0.4)
+    max_react = int(len(reply_pairs) * react_cap_ratio)
+    if len(react_pairs) > max_react:
+        random.seed(42)
+        react_pairs = random.sample(react_pairs, max_react)
+        stats["react_capped"] = max_react
+
+    # Sample none pairs.
+    # NOTE: append each sampled candidate ONCE (no recency multiplier). action_count is
+    # already recency-weighted, so multiplying none again would inflate it far past
+    # none_ratio (the original bug: 0.35 configured -> ~55% actual none).
     action_count = len(reply_pairs) + len(react_pairs) + len(reply_react_pairs) + len(gif_pairs)
     target_none = int(action_count * none_ratio / (1 - none_ratio))
     target_none = min(target_none, len(none_candidates))
@@ -365,16 +379,16 @@ def build_all_pairs(channels, config, now):
         if not context_text:
             continue
 
-        action = {"action": "none"}
-        multiplier = recency_multiplier(msg["timestamp"], now, weights)
-        for _ in range(multiplier):
-            none_pairs.append(make_entry(context_text, action))
+        none_pairs.append(make_entry(context_text, {"action": "none"}))
 
-    stats["none"] = len(sampled_nones)
+    stats["none"] = len(none_pairs)
 
     print(f"\n  Action counts (before recency weighting):")
     print(f"    reply:       {stats['reply']}")
     print(f"    react:       {stats['react']}")
+    if stats.get("react_capped"):
+        print(f"      (react-only capped to {stats['react_capped']} weighted pairs "
+              f"= {react_cap_ratio:.0%} of reply)")
     print(f"    reply_react: {stats['reply_react']}")
     print(f"    gif:         {stats['gif']} (x{gif_oversample} oversample)")
     print(f"    none:        {stats['none']} (sampled from {len(none_candidates)} candidates)")

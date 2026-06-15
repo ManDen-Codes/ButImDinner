@@ -2,9 +2,19 @@ import json
 import os
 import random
 import re
+import sys
 
 import discord
 import yaml
+
+# Windows consoles default to cp1252; bot output (emoji, mentions) is UTF-8.
+# Without this, printing an emoji-containing model output raises UnicodeEncodeError
+# and drops the message before it can be dispatched.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(SCRIPT_DIR)
@@ -99,10 +109,11 @@ UNICODE_EMOJIS = [
 _grammar_cache = {}
 
 
-def build_action_grammar(guild=None):
+def build_action_grammar(guild=None, allow_none=True):
     guild_id = guild.id if guild else None
-    if guild_id in _grammar_cache:
-        return _grammar_cache[guild_id]
+    cache_key = (guild_id, allow_none)
+    if cache_key in _grammar_cache:
+        return _grammar_cache[cache_key]
 
     emoji_alts = " | ".join(f'"{e}"' for e in UNICODE_EMOJIS)
     if guild and guild.emojis:
@@ -111,7 +122,10 @@ def build_action_grammar(guild=None):
     else:
         emoji_rule = f"emoji ::= {emoji_alts}"
 
-    grammar_str = rf"""root ::= action-reply | action-react | action-none | action-gif | action-reply-react
+    # When the bot is directly addressed, drop the "none" option so it always acts.
+    none_alt = " | action-none" if allow_none else ""
+
+    grammar_str = rf"""root ::= action-reply | action-react{none_alt} | action-gif | action-reply-react
 
 action-reply ::= "{{\"action\": \"reply\", \"text\": \"" text-content "\", \"mentions\": [" mentions-list "]}}"
 action-react ::= "{{\"action\": \"react\", \"emoji\": \"" emoji "\"}}"
@@ -129,7 +143,7 @@ escape-char ::= ["\\/bfnrt]
 {emoji_rule}
 """
     grammar = LlamaGrammar.from_string(grammar_str)
-    _grammar_cache[guild_id] = grammar
+    _grammar_cache[cache_key] = grammar
     return grammar
 
 
@@ -158,7 +172,7 @@ def build_prompt(context_messages, replied_to_id=None):
     return "\n".join(lines)
 
 
-def generate(context_text, guild=None):
+def generate(context_text, guild=None, allow_none=True):
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT + (" /no_think" if not USE_HF else "")},
         {"role": "user", "content": context_text},
@@ -181,7 +195,7 @@ def generate(context_text, guild=None):
         raw = tokenizer.decode(output[0][inputs.shape[-1]:], skip_special_tokens=True)
         return strip_thinking(raw).strip()
     else:
-        grammar = build_action_grammar(guild)
+        grammar = build_action_grammar(guild, allow_none)
         response = llm.create_chat_completion(
             messages=messages,
             max_tokens=MAX_TOKENS,
@@ -383,7 +397,7 @@ async def on_message(message):
     print(f"{channel_tag} Context:\n{context_text}")
 
     async with message.channel.typing():
-        raw_output = generate(context_text, guild=message.guild)
+        raw_output = generate(context_text, guild=message.guild, allow_none=not forced)
 
     print(f"{channel_tag} Raw output: {raw_output!r}")
     action = parse_action(raw_output)
@@ -412,7 +426,8 @@ async def on_message(message):
 
 @client.event
 async def on_guild_emojis_update(guild, before, after):
-    _grammar_cache.pop(guild.id, None)
+    for key in [k for k in _grammar_cache if k[0] == guild.id]:
+        _grammar_cache.pop(key, None)
 
 
 def main():

@@ -39,8 +39,10 @@ training:
   max_seq_length: 768
   lora_rank: 64
   lora_alpha: 128
-  # Oversample GIF training pairs (low count in dataset)
-  gif_oversample: 4
+  # Oversample GIF training pairs (low base count; keep high or gif never fires)
+  gif_oversample: 10
+  # Cap react-only pairs to this fraction of reply pairs (prevents react-defaulting)
+  react_cap_ratio: 0.4
   # Target ratio of "none" actions in dataset (0.35 = 35%)
   none_ratio: 0.35
   
