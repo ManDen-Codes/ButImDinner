@@ -1,4 +1,5 @@
 import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import yaml
 from datasets import load_dataset
@@ -108,18 +109,25 @@ def main():
             warmup_steps=100,
             bf16=True,
             logging_steps=10,
-            eval_strategy="epoch",
+            eval_strategy="no",
             save_strategy="steps",
             save_steps=150,
+            save_total_limit=3,
             seed=42,
         ),
     )
 
     print("Starting training...")
-    has_checkpoint = any(
-        d.startswith("checkpoint-") for d in os.listdir(output_dir)
-    ) if os.path.isdir(output_dir) else False
-    trainer.train(resume_from_checkpoint=has_checkpoint or None)
+    latest_checkpoint = None
+    if os.path.isdir(output_dir):
+        checkpoints = sorted(
+            [d for d in os.listdir(output_dir) if d.startswith("checkpoint-")],
+            key=lambda x: int(x.split("-")[1]),
+        )
+        if checkpoints:
+            latest_checkpoint = os.path.join(output_dir, checkpoints[-1])
+            print(f"Resuming from checkpoint: {latest_checkpoint}")
+    trainer.train(resume_from_checkpoint=latest_checkpoint)
 
     print(f"Saving LoRA adapter to {output_dir}")
     model.save_pretrained(output_dir)

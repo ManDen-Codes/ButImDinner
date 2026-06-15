@@ -2,6 +2,9 @@
 data/
 *.gguf
 
+# llama.cpp
+llama.cpp/
+
 # Unsloth runtime cache
 unsloth_compiled_cache/
 
