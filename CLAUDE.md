@@ -9,7 +9,7 @@ scraper → data processing → QLoRA fine-tuning → GGUF export → discord bo
 ```
 
 **Stack**: Python, discord.py, pure HuggingFace (transformers + peft + trl + bitsandbytes), llama-cpp-python (inference)
-**Base model**: Qwen3.5 9B (`Qwen/Qwen3.5-9B`)
+**Base model**: Qwen3 8B (`Qwen/Qwen3-8B`) — Qwen3.5-9B was abandoned: its hybrid Gated-DeltaNet architecture has no fast training kernel on Windows (~13x slower) and a GGUF NextN conversion gotcha
 **Training machine**: RTX 4070 Ti (12GB VRAM), QLoRA 4-bit, bf16
 **Inference machine**: ASUS laptop — Intel Core Ultra 285H, Intel Arc 140T iGPU, 32GB RAM — runs GGUF via llama-cpp-python (Vulkan backend); or any machine with the merged HF model
 
@@ -64,15 +64,21 @@ scraper → data processing → QLoRA fine-tuning → GGUF export → discord bo
 
 ```
 pip install torch --index-url https://download.pytorch.org/whl/cu130 --force-reinstall
-pip install datasets transformers peft trl==0.24.0 bitsandbytes pyyaml
+pip install datasets "transformers==4.57.6" peft trl==0.24.0 bitsandbytes pyyaml
 pip uninstall torchvision -y
 ```
 
 Note: `trl` must be pinned to `0.24.0` — newer versions have a Windows Unicode bug reading Jinja templates.
 
-**Training quirks for Qwen3.5-9B on 12GB VRAM:**
-- Set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (already in train.py) to prevent fragmentation OOM
-- Do NOT use `gradient_checkpointing=True` — it's 10x slower on Qwen3.5's hybrid architecture
+**CRITICAL — pin `transformers==4.57.6`:** transformers 5.x (e.g. 5.12.1) causes a ~20x QLoRA
+slowdown on this stack (Qwen3-8B went 5.6s/step → 123s/step; GPU pegged at 100% but glacial).
+Only reason to go to 5.x is `qwen3_5` support, which we abandoned. Do NOT `pip install -U transformers`
+— and note that upgrading transformers also silently pulls a CPU-only torch, so if you ever must
+upgrade, reinstall the cu130 torch afterward.
+
+**Training quirks on 12GB VRAM:**
+- `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` is set in train.py (harmless no-op on torch 2.12 Windows — "not supported on this platform" warning is expected)
+- Do NOT use `gradient_checkpointing=True` — ~10x slower here
 - Set `eval_strategy="no"` in train.py — eval OOMs at 12GB; use `training/eval.py` separately instead
 - `save_total_limit=3` keeps only the 3 most recent checkpoints to manage disk space
 

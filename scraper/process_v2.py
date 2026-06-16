@@ -12,10 +12,19 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(SCRIPT_DIR)
 RAW_DIR = os.path.join(ROOT_DIR, "data", "raw")
 PROCESSED_DIR = os.path.join(ROOT_DIR, "data", "processed")
+USER_INDEX_PATH = os.path.join(PROCESSED_DIR, "user_index.json")
 
 URL_RE = re.compile(r"https?://\S+")
 TENOR_RE = re.compile(r"https://tenor\.com/view/(.+)-(\d+)")
 MENTION_RE = re.compile(r"<@!?(\d+)>")
+CUSTOM_EMOJI_RE = re.compile(r"<a?:(\w+):\d+>")
+
+
+def normalize_emoji(emoji):
+    """Custom emoji come from Discord as '<:name:id>'; the bot/grammar use ':name:'.
+    Normalize so reaction outputs match inference. Unicode emoji pass through."""
+    m = CUSTOM_EMOJI_RE.fullmatch(emoji)
+    return f":{m.group(1)}:" if m else emoji
 
 SYSTEM_PROMPT = (
     "You are Dinner in a Discord server. Given the conversation context, "
@@ -30,6 +39,13 @@ def load_config():
         return yaml.safe_load(f)
 
 
+def get_dinner_ids(config):
+    """All accounts belonging to Dinner (primary + any alt accounts, same person)."""
+    ids = {config["dinner_user_id"]}
+    ids.update(config.get("dinner_alt_ids") or [])
+    return ids
+
+
 def load_all_messages():
     channels = {}
     for path in glob.glob(os.path.join(RAW_DIR, "*.json")):
@@ -41,11 +57,24 @@ def load_all_messages():
     return channels
 
 
-def build_user_map(channels):
+def load_user_index():
+    """id -> stable username (from fetch_usernames.py). Empty if not built yet."""
+    if not os.path.exists(USER_INDEX_PATH):
+        print("  WARNING: user_index.json not found — falling back to scraped display "
+              "names. Run scraper/fetch_usernames.py for stable usernames.")
+        return {}
+    with open(USER_INDEX_PATH, encoding="utf-8") as f:
+        return {int(k): v for k, v in json.load(f).items()}
+
+
+def build_user_map(channels, username_index=None):
+    # Start from scraped display names, then overlay stable usernames where available.
     user_map = {}
     for messages in channels.values():
         for msg in messages:
             user_map[msg["author_id"]] = msg["author_name"]
+    if username_index:
+        user_map.update(username_index)
     return user_map
 
 
@@ -108,20 +137,6 @@ def extract_tenor_query(content):
     return None
 
 
-def merge_consecutive(messages):
-    if not messages:
-        return []
-    merged = [messages[0].copy()]
-    for msg in messages[1:]:
-        if msg["author_id"] == merged[-1]["author_id"]:
-            merged[-1]["content"] += "\n" + msg["content"]
-            if msg.get("attachments"):
-                merged[-1].setdefault("attachments", []).extend(msg["attachments"])
-        else:
-            merged.append(msg.copy())
-    return merged
-
-
 def recency_multiplier(timestamp_str, now, weights):
     ts = datetime.fromisoformat(timestamp_str)
     if ts.tzinfo is None:
@@ -133,8 +148,7 @@ def recency_multiplier(timestamp_str, now, weights):
     return weights[-1]["weight"]
 
 
-def build_context_lines(context_msgs, replied_to, user_map, channel_map):
-    context_msgs = merge_consecutive(context_msgs)
+def build_context_lines(context_msgs, replied_to, user_map, channel_map, dinner_ids):
     lines = []
     for ctx in context_msgs:
         ctx_content = clean_context_content(ctx["content"], user_map, channel_map)
@@ -147,7 +161,14 @@ def build_context_lines(context_msgs, replied_to, user_map, channel_map):
 
         if ctx_content:
             prefix = "(replied to) " if replied_to and ctx["id"] == replied_to["id"] else ""
-            lines.append(f"{prefix}{ctx['author_name']}: {ctx_content}")
+            # Dinner's own messages are labeled "you" so the model recognizes its own
+            # turns — matches bot.py's inference-time labeling of the bot's messages.
+            # Everyone else uses their stable username (via user_map), not the scraped nick.
+            if ctx["author_id"] in dinner_ids:
+                name = "you"
+            else:
+                name = user_map.get(ctx["author_id"], ctx["author_name"])
+            lines.append(f"{prefix}{name}: {ctx_content}")
     return "\n".join(lines)
 
 
@@ -161,44 +182,44 @@ def make_entry(context_text, action_json):
     }
 
 
-def get_dinner_reply_targets(messages, dinner_id):
+def get_dinner_reply_targets(messages, dinner_ids):
     targets = set()
     for i, msg in enumerate(messages):
-        if msg["author_id"] != dinner_id:
+        if msg["author_id"] not in dinner_ids:
             continue
         if msg["reply_to_id"]:
             targets.add(msg["reply_to_id"])
         for j in range(i - 1, max(0, i - 4), -1):
-            if messages[j]["author_id"] != dinner_id:
+            if messages[j]["author_id"] not in dinner_ids:
                 targets.add(messages[j]["id"])
                 break
     return targets
 
 
-def get_dinner_reacted_ids(messages, dinner_id):
+def get_dinner_reacted_ids(messages, dinner_ids):
     reacted = set()
     for msg in messages:
         for r in msg.get("reactions", []):
-            if dinner_id in r.get("user_ids", []):
+            if any(d in r.get("user_ids", []) for d in dinner_ids):
                 reacted.add(msg["id"])
     return reacted
 
 
-def get_dinner_reaction_map(messages, dinner_id):
+def get_dinner_reaction_map(messages, dinner_ids):
     reaction_map = {}
     for msg in messages:
         for r in msg.get("reactions", []):
-            if dinner_id in r.get("user_ids", []):
+            if any(d in r.get("user_ids", []) for d in dinner_ids):
                 if msg["id"] not in reaction_map:
-                    reaction_map[msg["id"]] = r["emoji"]
+                    reaction_map[msg["id"]] = normalize_emoji(r["emoji"])
     return reaction_map
 
 
-def build_gif_index(channels, dinner_id):
+def build_gif_index(channels, dinner_ids):
     index = {}
     for messages in channels.values():
         for msg in messages:
-            if msg["author_id"] != dinner_id:
+            if msg["author_id"] not in dinner_ids:
                 continue
             match = TENOR_RE.search(msg["content"])
             if not match:
@@ -210,8 +231,9 @@ def build_gif_index(channels, dinner_id):
     return index
 
 
-def build_all_pairs(channels, config, now):
-    dinner_id = config["dinner_user_id"]
+def build_all_pairs(channels, config, now, username_index=None):
+    dinner_primary = config["dinner_user_id"]
+    dinner_ids = get_dinner_ids(config)
     context_window = config.get("scraper", {}).get("context_window", 10)
     weights = config.get("recency_weights", [
         {"months": 6, "weight": 4},
@@ -222,7 +244,12 @@ def build_all_pairs(channels, config, now):
     gif_oversample = config.get("training", {}).get("gif_oversample", 4)
     none_ratio = config.get("training", {}).get("none_ratio", 0.35)
 
-    user_map = build_user_map(channels)
+    user_map = build_user_map(channels, username_index)
+    # Normalize all of Dinner's accounts to one identity so mentions of either his old
+    # or current account render as the same name (and the model sees one persona).
+    primary_name = user_map.get(dinner_primary, "dinnerlore")
+    for did in dinner_ids:
+        user_map[did] = primary_name
     channel_map = build_channel_map(channels)
 
     reply_pairs = []
@@ -235,13 +262,13 @@ def build_all_pairs(channels, config, now):
 
     for channel_name, messages in channels.items():
         msg_by_id = {m["id"]: m for m in messages}
-        dinner_reply_targets = get_dinner_reply_targets(messages, dinner_id)
-        dinner_reacted_ids = get_dinner_reacted_ids(messages, dinner_id)
-        dinner_reaction_map = get_dinner_reaction_map(messages, dinner_id)
+        dinner_reply_targets = get_dinner_reply_targets(messages, dinner_ids)
+        dinner_reacted_ids = get_dinner_reacted_ids(messages, dinner_ids)
+        dinner_reaction_map = get_dinner_reaction_map(messages, dinner_ids)
 
         # --- reply, gif, reply_react pairs ---
         for i, msg in enumerate(messages):
-            if msg["author_id"] != dinner_id:
+            if msg["author_id"] not in dinner_ids:
                 continue
 
             cleaned = clean_content(msg["content"], user_map, channel_map)
@@ -258,7 +285,7 @@ def build_all_pairs(channels, config, now):
                 if replied_to not in context_msgs:
                     context_msgs.insert(0, replied_to)
 
-            context_text = build_context_lines(context_msgs, replied_to, user_map, channel_map)
+            context_text = build_context_lines(context_msgs, replied_to, user_map, channel_map, dinner_ids)
             if not context_text:
                 continue
 
@@ -322,7 +349,7 @@ def build_all_pairs(channels, config, now):
             start = max(0, i - context_window)
             context_msgs = messages[start:i + 1]
 
-            context_text = build_context_lines(context_msgs, None, user_map, channel_map)
+            context_text = build_context_lines(context_msgs, None, user_map, channel_map, dinner_ids)
             if not context_text:
                 continue
 
@@ -333,12 +360,12 @@ def build_all_pairs(channels, config, now):
             stats["react"] += 1
 
         # --- none candidates ---
-        dinner_active = any(m["author_id"] == dinner_id for m in messages)
+        dinner_active = any(m["author_id"] in dinner_ids for m in messages)
         if not dinner_active:
             continue
 
         for i, msg in enumerate(messages):
-            if msg["author_id"] == dinner_id:
+            if msg["author_id"] in dinner_ids:
                 continue
             if msg["id"] in dinner_reply_targets:
                 continue
@@ -373,9 +400,7 @@ def build_all_pairs(channels, config, now):
         start = max(0, i - context_window)
         context_msgs = messages[start:i + 1]
 
-        user_map_local = build_user_map(channels)
-        channel_map_local = build_channel_map(channels)
-        context_text = build_context_lines(context_msgs, None, user_map_local, channel_map_local)
+        context_text = build_context_lines(context_msgs, None, user_map, channel_map, dinner_ids)
         if not context_text:
             continue
 
@@ -445,15 +470,19 @@ def main():
     print(f"Loaded {total_msgs} messages from {len(channels)} channels")
 
     print("Building GIF index...")
-    gif_index = build_gif_index(channels, config["dinner_user_id"])
+    gif_index = build_gif_index(channels, get_dinner_ids(config))
     gif_index_path = os.path.join(PROCESSED_DIR, "gif_index.json")
     with open(gif_index_path, "w", encoding="utf-8") as f:
         json.dump(gif_index, f, ensure_ascii=False, indent=2)
     print(f"  {len(gif_index)} unique GIFs -> {gif_index_path}")
 
+    print("Loading username index...")
+    username_index = load_user_index()
+    print(f"  {len(username_index)} usernames loaded")
+
     print("Building v2 training pairs...")
     random.seed(42)
-    pairs = build_all_pairs(channels, config, now)
+    pairs = build_all_pairs(channels, config, now, username_index)
     print(f"\nTotal pairs (after weighting): {len(pairs)}")
 
     if not pairs:

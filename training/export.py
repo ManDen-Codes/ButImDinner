@@ -27,7 +27,7 @@ def main():
     print(f"Loading base model: {base_model}")
     model = AutoModelForCausalLM.from_pretrained(
         base_model,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         device_map="cpu",
     )
     tokenizer = AutoTokenizer.from_pretrained(base_model)

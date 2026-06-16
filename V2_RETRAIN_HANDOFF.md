@@ -22,8 +22,15 @@ training machine and re-run the pipeline:
 - ✅ **#2 react cap + gif oversample** — `react_cap_ratio` knob added; `gif_oversample`
   bumped to 10 in config. (Finer per-action ratio targeting still optional.)
 - ✅ **#4 role-mention cleaning** — `clean_content` now strips `<@&id>`.
-- ⚠️ **#3 format mismatches** — NOT yet changed; still needs a decision + edits to align
-  `bot.py` and `process_v2.py` (see that section).
+- ✅ **#3 format mismatches** — RESOLVED 2026-06-15. Decisions: (a) Dinner's own context
+  messages are labeled `you:` in training (`build_context_lines` now takes `dinner_id`),
+  matching bot.py; (b) **stop merging** consecutive same-author messages — `merge_consecutive`
+  removed from `process_v2.py` (bot.py already doesn't merge); (c) action-mix knobs kept as-is.
+  Also aligned `bot.py`'s context cleaning to training: new `clean_context()` strips role
+  pings, resolves user mentions to **display names** (was usernames), resolves channel
+  mentions, normalizes custom emoji, replaces URLs with `[link]`, collapses whitespace, and
+  tags attachments (`[+attachment]`/`[shared media]`) — previously none of this happened at
+  inference. System-prompt `/no_think` suffix on GGUF left as-is (harmless; grammar forces JSON).
 - New config knobs (`config.example.yaml` / `config.yaml`): `gif_oversample: 10`,
   `react_cap_ratio: 0.4`. **Make sure the training machine's `config.yaml` has these.**
 

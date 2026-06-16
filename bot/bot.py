@@ -53,7 +53,7 @@ if USE_HF:
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_PATH,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         device_map="auto",
     )
     model.eval()
@@ -134,7 +134,7 @@ action-gif ::= "{{\"action\": \"gif\", \"query\": \"" text-content "\"}}"
 action-reply-react ::= "{{\"action\": \"reply_react\", \"text\": \"" text-content "\", \"emoji\": \"" emoji "\", \"mentions\": [" mentions-list "]}}"
 
 mentions-list ::= "" | "\"" mention-name "\"" ("," " \"" mention-name "\"")*
-mention-name ::= [a-zA-Z0-9_]+
+mention-name ::= [a-zA-Z0-9_.]+
 
 text-content ::= text-char+
 text-char ::= [^"\\] | "\\" escape-char
@@ -153,21 +153,44 @@ def strip_thinking(text):
     return text.strip()
 
 
-def clean_mentions(msg):
+def clean_context(msg, guild):
+    """Mirror process_v2.py clean_context_content so inference context matches
+    training format exactly: strip role pings, resolve user/channel mentions to
+    readable names, normalize custom emoji, replace URLs with [link]."""
     text = msg.content.strip()
+    # Role mentions -> drop (training strips <@&id>; never feed raw role pings).
+    text = re.sub(r"<@&\d+>", "", text)
+    # User mentions -> @username (bot's own -> configured mention_name). Usernames are
+    # stable; nicknames drift, so we match training which uses usernames.
     for user in msg.mentions:
         name = BOT_MENTION_NAME if BOT_MENTION_NAME and user.id == client.user.id else user.name
         text = re.sub(rf"<@!?{user.id}>", f"@{name}", text)
+    text = re.sub(r"<@!?\d+>", "@unknown", text)
+    # Channel mentions -> #name.
+    def repl_channel(m):
+        ch = guild.get_channel(int(m.group(1))) if guild else None
+        return f"#{ch.name}" if ch else "#unknown"
+    text = re.sub(r"<#(\d+)>", repl_channel, text)
+    # Custom emoji -> :name:.
+    text = re.sub(r"<a?:(\w+):\d+>", r":\1:", text)
+    # URLs -> [link].
+    text = re.sub(r"https?://\S+", "[link]", text)
+    # Collapse doubled whitespace (matches training).
+    text = re.sub(r"\s{2,}", " ", text).strip()
     return text
 
 
-def build_prompt(context_messages, replied_to_id=None):
+def build_prompt(context_messages, guild=None, replied_to_id=None):
     lines = []
     for msg in context_messages:
-        if msg.content.strip():
+        content = clean_context(msg, guild)
+        # Attachment tagging mirrors process_v2.py build_context_lines.
+        if msg.attachments:
+            content = f"{content} [+attachment]" if content else "[shared media]"
+        if content:
             prefix = "(replied to) " if replied_to_id and msg.id == replied_to_id else ""
-            name = "you" if msg.author == client.user else msg.author.display_name
-            content = clean_mentions(msg)
+            # Username (stable) for speaker labels, matching training; bot's own -> "you".
+            name = "you" if msg.author == client.user else msg.author.name
             lines.append(f"{prefix}{name}: {content}")
     return "\n".join(lines)
 
@@ -225,13 +248,14 @@ def resolve_output_mentions(text, mention_names, guild):
         return text
 
     def resolve_mention(match):
-        name = match.group(1).lower()
+        name = match.group(1).lower().rstrip(".")
         for member in guild.members:
             if member.name.lower() == name or (member.nick and member.nick.lower() == name):
                 return member.mention
         return match.group(0)
 
-    text = re.sub(r"@(\w+)", resolve_mention, text)
+    # Allow dots — new Discord usernames can contain them (e.g. dinner.lore).
+    text = re.sub(r"@([a-zA-Z0-9_.]+)", resolve_mention, text)
     return text
 
 
@@ -389,7 +413,7 @@ async def on_message(message):
             except discord.NotFound:
                 pass
 
-    context_text = build_prompt(history, replied_to_id=replied_to_id)
+    context_text = build_prompt(history, guild=message.guild, replied_to_id=replied_to_id)
     if not context_text:
         return
 
