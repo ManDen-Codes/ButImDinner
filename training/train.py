@@ -1,5 +1,8 @@
 import os
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+# expandable_segments isn't supported on torch 2.12 Windows; max_split_size_mb is the
+# anti-fragmentation knob that does work. Fragmentation at ~95% VRAM was collapsing
+# step speed (6s -> 150s+ over a run). Keep peak memory low (see batch/seq in config).
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:256"
 
 import yaml
 from datasets import load_dataset
