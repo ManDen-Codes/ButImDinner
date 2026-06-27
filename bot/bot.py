@@ -122,10 +122,17 @@ def build_action_grammar(guild=None, allow_none=True):
     else:
         emoji_rule = f"emoji ::= {emoji_alts}"
 
-    # When the bot is directly addressed, drop the "none" option so it always acts.
-    none_alt = " | action-none" if allow_none else ""
+    if allow_none:
+        # Passive/random engagement: full action set, including staying silent.
+        root_rule = "root ::= action-reply | action-react | action-none | action-gif | action-reply-react"
+    else:
+        # Forced engagement (bot was replied to or @mentioned): it should actually respond.
+        # Drop "none" (don't ignore a direct address) AND bare "react": with "none" removed
+        # the model otherwise falls back to a low-effort react ~90% of the time (verified on
+        # the GGUF). reply, gif, and reply_react (which still carries an emoji) remain.
+        root_rule = "root ::= action-reply | action-gif | action-reply-react"
 
-    grammar_str = rf"""root ::= action-reply | action-react{none_alt} | action-gif | action-reply-react
+    grammar_str = rf"""{root_rule}
 
 action-reply ::= "{{\"action\": \"reply\", \"text\": \"" text-content "\", \"mentions\": [" mentions-list "]}}"
 action-react ::= "{{\"action\": \"react\", \"emoji\": \"" emoji "\"}}"
