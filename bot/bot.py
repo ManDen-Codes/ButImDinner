@@ -223,14 +223,25 @@ def generate(context_text, guild=None, allow_none=True):
         return strip_thinking(raw).strip()
     else:
         grammar = build_action_grammar(guild, allow_none)
-        response = llm.create_chat_completion(
-            messages=messages,
+        # Build the ChatML prompt by hand to exactly match the training format. Using
+        # create_chat_completion let llama-cpp-python auto-guess the chat format from the
+        # GGUF metadata; for Qwen3's complex template it fell back to a wrong format, so the
+        # model saw an out-of-distribution prompt at inference (gif never chosen, react/none
+        # over-chosen). The model is verified correct when given this exact ChatML (matches
+        # the HF backend). llama.cpp parses <|im_start|>/<|im_end|> as special tokens.
+        prompt = (
+            f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
+            f"<|im_start|>user\n{context_text}<|im_end|>\n"
+            f"<|im_start|>assistant\n"
+        )
+        response = llm(
+            prompt,
             max_tokens=MAX_TOKENS,
             temperature=TEMPERATURE,
             top_p=TOP_P,
             grammar=grammar,
         )
-        raw = response["choices"][0]["message"]["content"]
+        raw = response["choices"][0]["text"]
         return strip_thinking(raw).strip()
 
 
