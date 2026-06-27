@@ -196,8 +196,12 @@ def build_prompt(context_messages, guild=None, replied_to_id=None):
 
 
 def generate(context_text, guild=None, allow_none=True):
+    # Match training exactly: training fed the clean SYSTEM_PROMPT (no "/no_think").
+    # Appending "/no_think" put the GGUF prompt out-of-distribution, collapsing the
+    # action choice toward none/react and suppressing gif. The GBNF grammar already
+    # forces JSON output, so thinking can't leak regardless.
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT + (" /no_think" if not USE_HF else "")},
+        {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": context_text},
     ]
 
