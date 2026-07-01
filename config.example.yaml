@@ -29,43 +29,78 @@ recency_weights:
   - months: 9999
     weight: 1
 
-# Training settings
+# Data processing (process_v2.py) — plain-text persona + reaction datasets
+processing:
+  # Split messages into conversation blocks where the gap exceeds this many minutes
+  conversation_gap_minutes: 60
+  # Merge consecutive messages from the same author within this window into one turn
+  merge_window_minutes: 5
+  # Context cap per training example
+  context_max_turns: 12
+  context_max_chars: 1500
+  # Downsample any single interlocutor above this fraction (anti dominant-speaker overfit)
+  dominant_speaker_cap_ratio: 0.2
+  # Drop Dinner replies shorter than this (gif-only targets are always kept)
+  min_reply_chars: 2
+  # Duplicate gif targets this many times (1 = natural rate; raise if gifs too rare)
+  gif_oversample: 1
+  # Reaction dataset: none examples per positive, emoji vocab thresholds
+  reaction_none_ratio: 1.0
+  reaction_min_emoji_count: 5
+  reaction_top_k_emoji: 25
+  train_ratio: 0.9
+
+# Persona model — plain message generation (process_v2 -> train.py)
 training:
-  base_model: "Qwen/Qwen3-8B"
+  base_model: "Qwen/Qwen3-8B-Base"   # base, not instruct: no chat template / no <think>
   epochs: 3
-  batch_size: 2
-  gradient_accumulation_steps: 8
+  batch_size: 1
+  gradient_accumulation_steps: 16
   learning_rate: 0.0001
-  max_seq_length: 768
+  max_seq_length: 512
   lora_rank: 64
   lora_alpha: 128
-  # Oversample GIF training pairs (low base count; keep high or gif never fires)
-  gif_oversample: 10
-  # Cap react-only pairs to this fraction of reply pairs (prevents react-defaulting)
-  react_cap_ratio: 0.4
-  # Target ratio of "none" actions in dataset (0.35 = 35%)
-  none_ratio: 0.35
-  
+
+# Reaction model — tiny context->emoji/none classifier (train_reactions.py)
+reaction:
+  base_model: "Qwen/Qwen3-0.6B-Base"
+  epochs: 4
+  batch_size: 8
+  gradient_accumulation_steps: 2
+  learning_rate: 0.0002
+  max_seq_length: 768
+  lora_rank: 32
+  lora_alpha: 64
+
 # Bot settings
 bot:
-  # Chance of engaging with any message — model decides what action to take (0.05 = 5%)
+  # Dinner's stable username — his speaker label + self-mention name. MUST match the
+  # username for dinner_user_id in user_index.json (what process_v2 trained under).
+  persona_name: "dinnerlore"
+  # Chance of replying to a random message in an allowed channel
   engagement_chance: 0.05
+  # Chance of running the reaction step (the reaction model may still decline with
+  # "none"; with the heuristic this is the literal react frequency)
+  react_chance: 0.05
+  # Enable/disable gif sending without retraining
+  gif_enabled: true
+  # Max separate messages to send per burst (Dinner-style multi-message replies)
+  max_reply_segments: 4
   # Channel IDs the bot is allowed to engage in
   allowed_channels:
     - 000000000000000000
-  # Path to the GGUF model file
-  model_path: "data/model/dinner.gguf"
-  # Number of recent messages to use as context when generating a reply
-  context_messages: 10
+  # Persona model: GGUF file or HF dir (auto-detected)
+  model_path: "data/model/dinner_q8.gguf"
+  # Reaction model: GGUF file or HF dir; leave "" to use the emoji-frequency heuristic
+  reaction_model_path: "data/model/dinner_reaction_q8.gguf"
+  # Number of recent messages to use as context
+  context_messages: 12
   # Maximum tokens in a generated reply
   max_response_tokens: 256
   # Always reply when @mentioned (true/false)
   reply_on_mention: false
   # Decay rate for reply chains — probability of replying = decay^(bot_replies_in_chain)
-  # 0.5 = 50% after 1st reply, 25% after 2nd, 12.5% after 3rd, etc.
   reply_chain_decay: 0.65
-  # Name to replace bot's @mention with in model input
-  mention_name: "dinner"
   # Generation parameters
   temperature: 0.8
   top_p: 0.9

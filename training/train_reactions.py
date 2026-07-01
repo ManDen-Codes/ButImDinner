@@ -1,12 +1,10 @@
 import os
-# expandable_segments works for 8B on this Blackwell/torch stack (10.8GB peak at
-# batch1/seq512); it crashed only on 14B. max_split_size_mb is the fallback knob.
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import yaml
 from datasets import load_dataset
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from peft import LoraConfig, get_peft_model
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import SFTTrainer, SFTConfig
 import torch  # MUST be the last import (datasets crashes silently on Windows otherwise)
 
@@ -21,42 +19,31 @@ def load_config():
 
 def main():
     config = load_config()
-    tc = config.get("training", {})
+    rc = config.get("reaction", {})
 
-    # Base (non-instruct) model: no chat template / no <think> tokens to fight.
-    # The dataset is plain prompt/completion (process_v2.py); we train completion-only
-    # so the model learns ONLY to produce Dinner's turn, not the surrounding context.
-    base_model = tc.get("base_model", "Qwen/Qwen3-8B-Base")
-    max_seq_length = tc.get("max_seq_length", 768)
-    lora_rank = tc.get("lora_rank", 64)
-    lora_alpha = tc.get("lora_alpha", 128)
-    epochs = tc.get("epochs", 3)
-    batch_size = tc.get("batch_size", 2)
-    grad_accum = tc.get("gradient_accumulation_steps", 8)
-    lr = tc.get("learning_rate", 2e-4)
+    # Tiny base model that decides Dinner's reaction: context -> ":emoji:" or "none".
+    # Runs as a SECOND model in the bot ("cluster"), output constrained by a GBNF
+    # grammar to Dinner's emoji set + "none". Small enough to skip 4-bit quant.
+    base_model = rc.get("base_model", "Qwen/Qwen3-0.6B-Base")
+    max_seq_length = rc.get("max_seq_length", 768)
+    lora_rank = rc.get("lora_rank", 32)
+    lora_alpha = rc.get("lora_alpha", 64)
+    epochs = rc.get("epochs", 4)
+    batch_size = rc.get("batch_size", 8)
+    grad_accum = rc.get("gradient_accumulation_steps", 2)
+    lr = rc.get("learning_rate", 2e-4)
 
-    print(f"Loading base model: {base_model}")
-
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_compute_dtype=torch.bfloat16,
-    )
+    print(f"Loading reaction base model: {base_model}")
 
     model = AutoModelForCausalLM.from_pretrained(
         base_model,
-        quantization_config=bnb_config,
         device_map="auto",
         dtype=torch.bfloat16,
     )
     tokenizer = AutoTokenizer.from_pretrained(base_model)
-
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.model_max_length = max_seq_length
-
-    model = prepare_model_for_kbit_training(model)
 
     lora_config = LoraConfig(
         r=lora_rank,
@@ -69,18 +56,17 @@ def main():
         bias="none",
         task_type="CAUSAL_LM",
     )
-
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
-    train_path = os.path.join(ROOT_DIR, "data", "processed", "train.jsonl")
-    val_path = os.path.join(ROOT_DIR, "data", "processed", "val.jsonl")
+    train_path = os.path.join(ROOT_DIR, "data", "processed", "reactions_train.jsonl")
+    val_path = os.path.join(ROOT_DIR, "data", "processed", "reactions_val.jsonl")
 
-    print("Loading dataset...")
-    # Each row is {"prompt": "<transcript>\ndinnerlore:", "completion": " <message>"}.
+    print("Loading reaction dataset...")
+    # Rows: {"prompt": "<transcript>\n[reaction]:", "completion": " :emoji:" | " none"}.
     dataset = load_dataset("json", data_files={"train": train_path, "validation": val_path})
 
-    output_dir = os.path.join(ROOT_DIR, "data", "model", "lora_adapter")
+    output_dir = os.path.join(ROOT_DIR, "data", "model", "reaction_adapter")
 
     trainer = SFTTrainer(
         model=model,
@@ -90,25 +76,29 @@ def main():
         args=SFTConfig(
             output_dir=output_dir,
             max_length=max_seq_length,
-            completion_only_loss=True,   # mask the prompt; loss only on Dinner's reply
+            completion_only_loss=True,   # loss only on the emoji/none decision
             packing=False,
             per_device_train_batch_size=batch_size,
             gradient_accumulation_steps=grad_accum,
             num_train_epochs=epochs,
             learning_rate=lr,
             lr_scheduler_type="cosine",
-            warmup_steps=100,
+            warmup_ratio=0.05,
             bf16=True,
             logging_steps=10,
-            eval_strategy="no",          # eval OOMs at 12-16GB; use training/eval.py
-            save_strategy="steps",
-            save_steps=150,
+            eval_strategy="epoch",       # tiny eval set; safe to run inline here
+            save_strategy="epoch",
             save_total_limit=3,
+            # Sparse/imbalanced reaction data overfits fast (eval_loss bottoms ~epoch 2
+            # then climbs). Keep the best-generalizing checkpoint, not the last one.
+            load_best_model_at_end=True,
+            metric_for_best_model="eval_loss",
+            greater_is_better=False,
             seed=42,
         ),
     )
 
-    print("Starting training...")
+    print("Starting reaction training...")
     latest_checkpoint = None
     if os.path.isdir(output_dir):
         checkpoints = sorted(
@@ -120,10 +110,10 @@ def main():
             print(f"Resuming from checkpoint: {latest_checkpoint}")
     trainer.train(resume_from_checkpoint=latest_checkpoint)
 
-    print(f"Saving LoRA adapter to {output_dir}")
+    print(f"Saving reaction adapter to {output_dir}")
     model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
-    print("Training complete!")
+    print("Reaction training complete!")
 
 
 if __name__ == "__main__":

@@ -8,8 +8,6 @@ import discord
 import yaml
 
 # Windows consoles default to cp1252; bot output (emoji, mentions) is UTF-8.
-# Without this, printing an emoji-containing model output raises UnicodeEncodeError
-# and drops the message before it can be dispatched.
 for _stream in (sys.stdout, sys.stderr):
     try:
         _stream.reconfigure(encoding="utf-8", errors="replace")
@@ -21,286 +19,283 @@ ROOT_DIR = os.path.dirname(SCRIPT_DIR)
 
 
 def load_config():
-    config_path = os.path.join(ROOT_DIR, "config.yaml")
-    with open(config_path) as f:
+    with open(os.path.join(ROOT_DIR, "config.yaml")) as f:
         return yaml.safe_load(f)
 
 
 config = load_config()
 bot_config = config.get("bot", {})
+proc_config = config.get("processing", {})
 
 ENGAGEMENT_CHANCE = bot_config.get("engagement_chance", 0.05)
 ALLOWED_CHANNELS = set(bot_config.get("allowed_channels", []))
-MODEL_PATH = bot_config.get("model_path", "data/model/dinner.gguf")
-CONTEXT_MESSAGES = bot_config.get("context_messages", 10)
+MODEL_PATH = bot_config.get("model_path", "data/model/dinner_q8.gguf")
+REACTION_MODEL_PATH = bot_config.get("reaction_model_path", "")
+CONTEXT_MESSAGES = bot_config.get("context_messages", 12)
 MAX_TOKENS = bot_config.get("max_response_tokens", 256)
 TEMPERATURE = bot_config.get("temperature", 0.8)
 TOP_P = bot_config.get("top_p", 0.9)
-BOT_MENTION_NAME = bot_config.get("mention_name", "dinner")
 REPLY_ON_MENTION = bot_config.get("reply_on_mention", True)
 REPLY_CHAIN_DECAY = bot_config.get("reply_chain_decay", 0.5)
+# Stable username Dinner trained under — MUST match process_v2 primary_name (the
+# username for dinner_user_id). Used as his speaker label and self-mention name.
+PERSONA_NAME = bot_config.get("persona_name", "dinnerlore")
+GIF_ENABLED = bot_config.get("gif_enabled", True)
+REACT_CHANCE = bot_config.get("react_chance", 0.05)
+MAX_SEGMENTS = bot_config.get("max_reply_segments", 4)
+MERGE_WINDOW = proc_config.get("merge_window_minutes", 5) * 60
+# Context caps — MUST match process_v2 (context_max_turns / context_max_chars) so the
+# inference transcript is shaped exactly like the training prompts.
+CONTEXT_MAX_TURNS = proc_config.get("context_max_turns", 12)
+CONTEXT_MAX_CHARS = proc_config.get("context_max_chars", 1500)
+# Fetch enough raw messages to fill the turn cap even after same-author merging.
+FETCH_LIMIT = max(CONTEXT_MESSAGES, CONTEXT_MAX_TURNS * 2)
 
-if not os.path.isabs(MODEL_PATH):
-    MODEL_PATH = os.path.join(ROOT_DIR, MODEL_PATH)
+# Cue appended to the reaction model's prompt — MUST match process_v2.REACT_CUE.
+REACT_CUE = "\n[reaction]:"
 
-USE_HF = os.path.isdir(MODEL_PATH)
+TENOR_RE = re.compile(r"https://tenor\.com/view/(.+?)-(\d+)")
+GIF_TOKEN_RE = re.compile(r"\[gif:\s*(.*?)\]")
+URL_RE = re.compile(r"https?://\S+")
 
-if USE_HF:
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    import torch
 
-    print(f"Loading HF model from {MODEL_PATH}...")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_PATH,
-        dtype=torch.bfloat16,
-        device_map="auto",
-    )
-    model.eval()
-    print("Model loaded!")
-else:
-    from llama_cpp import Llama, LlamaGrammar
+def resolve_path(p):
+    if p and not os.path.isabs(p):
+        return os.path.join(ROOT_DIR, p)
+    return p
 
-    print(f"Loading GGUF model from {MODEL_PATH}...")
-    llm = Llama(
-        model_path=MODEL_PATH,
-        n_ctx=2048,
-        n_gpu_layers=-1,
-        verbose=False,
-    )
-    print("Model loaded!")
 
-GIF_INDEX_PATH = os.path.join(ROOT_DIR, "data", "processed", "gif_index.json")
-gif_index = {}
-if os.path.exists(GIF_INDEX_PATH):
-    with open(GIF_INDEX_PATH, encoding="utf-8") as f:
-        gif_index = json.load(f)
-    print(f"Loaded {len(gif_index)} GIFs from index")
-else:
-    print("No GIF index found — gif actions will be skipped")
+def load_model(path, n_ctx=2048):
+    """Auto-detect backend: directory -> HF transformers, .gguf file -> llama.cpp.
+    Returns a dict describing the loaded model, or None if path is empty/missing."""
+    path = resolve_path(path)
+    if not path or not os.path.exists(path):
+        return None
+    if os.path.isdir(path):
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        import torch
+        print(f"Loading HF model from {path}...")
+        tok = AutoTokenizer.from_pretrained(path)
+        if tok.pad_token is None:
+            tok.pad_token = tok.eos_token
+        mdl = AutoModelForCausalLM.from_pretrained(path, dtype=torch.bfloat16, device_map="auto")
+        mdl.eval()
+        return {"kind": "hf", "model": mdl, "tokenizer": tok, "torch": torch}
+    else:
+        from llama_cpp import Llama, LlamaGrammar
+        print(f"Loading GGUF model from {path}...")
+        llm = Llama(model_path=path, n_ctx=n_ctx, n_gpu_layers=-1, verbose=False)
+        return {"kind": "gguf", "llm": llm, "LlamaGrammar": LlamaGrammar}
+
+
+print("Loading persona model...")
+persona = load_model(MODEL_PATH)
+if persona is None:
+    raise SystemExit(f"Persona model not found at {resolve_path(MODEL_PATH)}")
+print("Persona model loaded!")
+
+reaction = load_model(REACTION_MODEL_PATH)
+print("Reaction model loaded!" if reaction else
+      "No reaction model — using emoji-frequency heuristic.")
+
+# --- gif index + reaction emoji frequencies ---
+def load_json(rel):
+    p = os.path.join(ROOT_DIR, rel)
+    if os.path.exists(p):
+        with open(p, encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+gif_index = load_json("data/processed/gif_index.json")
+print(f"Loaded {len(gif_index)} GIFs from index" if gif_index else "No GIF index found")
+
+REACTION_FREQ = load_json("data/processed/reaction_emoji_freq.json")
+REACTION_VOCAB = list(REACTION_FREQ.keys())
+print(f"Loaded {len(REACTION_VOCAB)} reaction emoji")
 
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 client = discord.Client(intents=intents)
 
-SYSTEM_PROMPT = (
-    "You are Dinner in a Discord server. Given the conversation context, "
-    "decide what to do. Output a JSON action: reply, react, gif, reply_react, "
-    "or none. Reply in character."
-)
-
-UNICODE_EMOJIS = [
-    "\U0001f602", "\U0001f62d", "\U0001f480", "\U0001f525", "❤️",
-    "\U0001f60d", "\U0001f97a", "\U0001f60e", "\U0001f923", "\U0001f624",
-    "\U0001f621", "\U0001f914", "\U0001f60f", "\U0001f970", "\U0001f633",
-    "\U0001f44d", "\U0001f44e", "\U0001f440", "\U0001f64f", "\U0001f4af",
-    "\U0001f5ff", "\U0001f608", "\U0001f921", "\U0001f494", "✨",
-    "\U0001f389", "\U0001f610", "\U0001f611", "\U0001f92e", "\U0001f922",
-    "\U0001f634", "\U0001f92f", "\U0001f972", "\U0001f62e", "\U0001f631",
-    "\U0001fae1", "\U0001fae0", "\U0001f91d", "✅", "❌",
-    "⭐", "\U0001f410", "\U0001f4aa", "\U0001f614", "\U0001f622",
-    "\U0001f644", "\U0001f62c", "\U0001f913", "\U0001f485", "\U0001f47b",
-    "\U0001f3b6", "\U0001f937", "\U0001f441️", "\U0001f9e0", "\U0001f60b",
-    "\U0001f928", "\U0001f60a", "\U0001fae3", "\U0001fae5", "\U0001f44d\U0001f3fb",
-]
-
-# Grammar cache per guild
-_grammar_cache = {}
+_reaction_grammar = None
 
 
-def build_action_grammar(guild=None, allow_none=True):
-    guild_id = guild.id if guild else None
-    cache_key = (guild_id, allow_none)
-    if cache_key in _grammar_cache:
-        return _grammar_cache[cache_key]
-
-    emoji_alts = " | ".join(f'"{e}"' for e in UNICODE_EMOJIS)
-    if guild and guild.emojis:
-        custom_alts = " | ".join(f'":{e.name}:"' for e in guild.emojis)
-        emoji_rule = f"emoji ::= {emoji_alts} | {custom_alts}"
-    else:
-        emoji_rule = f"emoji ::= {emoji_alts}"
-
-    if allow_none:
-        # Passive/random engagement: full action set, including staying silent.
-        root_rule = "root ::= action-reply | action-react | action-none | action-gif | action-reply-react"
-    else:
-        # Forced engagement (bot was replied to or @mentioned): it should actually respond.
-        # Drop "none" (don't ignore a direct address) AND bare "react": with "none" removed
-        # the model otherwise falls back to a low-effort react ~90% of the time (verified on
-        # the GGUF). reply, gif, and reply_react (which still carries an emoji) remain.
-        root_rule = "root ::= action-reply | action-gif | action-reply-react"
-
-    grammar_str = rf"""{root_rule}
-
-action-reply ::= "{{\"action\": \"reply\", \"text\": \"" text-content "\", \"mentions\": [" mentions-list "]}}"
-action-react ::= "{{\"action\": \"react\", \"emoji\": \"" emoji "\"}}"
-action-none ::= "{{\"action\": \"none\"}}"
-action-gif ::= "{{\"action\": \"gif\", \"query\": \"" text-content "\"}}"
-action-reply-react ::= "{{\"action\": \"reply_react\", \"text\": \"" text-content "\", \"emoji\": \"" emoji "\", \"mentions\": [" mentions-list "]}}"
-
-mentions-list ::= "" | "\"" mention-name "\"" ("," " \"" mention-name "\"")*
-mention-name ::= [a-zA-Z0-9_.]+
-
-text-content ::= text-char+
-text-char ::= [^"\\] | "\\" escape-char
-escape-char ::= ["\\/bfnrt]
-
-{emoji_rule}
-"""
-    grammar = LlamaGrammar.from_string(grammar_str)
-    _grammar_cache[cache_key] = grammar
-    return grammar
+def reaction_grammar():
+    """GBNF constraining the reaction model to Dinner's emoji vocab or 'none'."""
+    global _reaction_grammar
+    if reaction is None or reaction["kind"] != "gguf":
+        return None
+    if _reaction_grammar is None:
+        def lit(s):
+            return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+        alts = " | ".join(lit(e) for e in REACTION_VOCAB) or '"none"'
+        grammar_str = f'root ::= " "? ( {alts} | "none" )\n'
+        _reaction_grammar = reaction["LlamaGrammar"].from_string(grammar_str)
+    return _reaction_grammar
 
 
-def strip_thinking(text):
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
-    text = re.sub(r"<think>.*", "", text, flags=re.DOTALL)
-    return text.strip()
-
-
-def clean_context(msg, guild):
-    """Mirror process_v2.py clean_context_content so inference context matches
-    training format exactly: strip role pings, resolve user/channel mentions to
-    readable names, normalize custom emoji, replace URLs with [link]."""
-    text = msg.content.strip()
-    # Role mentions -> drop (training strips <@&id>; never feed raw role pings).
-    text = re.sub(r"<@&\d+>", "", text)
-    # User mentions -> @username (bot's own -> configured mention_name). Usernames are
-    # stable; nicknames drift, so we match training which uses usernames.
-    for user in msg.mentions:
-        name = BOT_MENTION_NAME if BOT_MENTION_NAME and user.id == client.user.id else user.name
-        text = re.sub(rf"<@!?{user.id}>", f"@{name}", text)
+# ---------------------------------------------------------------------------
+# Context rendering — MUST mirror process_v2.render_message (is_target=False)
+# so inference context matches the training transcript format exactly.
+# ---------------------------------------------------------------------------
+def render_ctx_msg(msg, guild):
+    text = msg.content
+    text = TENOR_RE.sub(lambda m: "[gif: " + " ".join(m.group(1).lower().split("-")) + "]", text)
+    text = re.sub(r"<@&\d+>", "", text)                       # role mentions: drop
+    for u in msg.mentions:
+        name = PERSONA_NAME if (client.user and u.id == client.user.id) else u.name
+        text = re.sub(rf"<@!?{u.id}>", f"@{name}", text)
     text = re.sub(r"<@!?\d+>", "@unknown", text)
-    # Channel mentions -> #name.
     def repl_channel(m):
         ch = guild.get_channel(int(m.group(1))) if guild else None
         return f"#{ch.name}" if ch else "#unknown"
     text = re.sub(r"<#(\d+)>", repl_channel, text)
-    # Custom emoji -> :name:.
-    text = re.sub(r"<a?:(\w+):\d+>", r":\1:", text)
-    # URLs -> [link].
-    text = re.sub(r"https?://\S+", "[link]", text)
-    # Collapse doubled whitespace (matches training).
+    text = re.sub(r"<a?:(\w+):\d+>", r":\1:", text)           # custom emoji -> :name:
+    text = URL_RE.sub("[link]", text)                          # non-gif URLs
     text = re.sub(r"\s{2,}", " ", text).strip()
-    return text
+    if msg.attachments:
+        text = (text + " [image]").strip() if text else "[image]"
+    return text or None
 
 
-def build_prompt(context_messages, guild=None, replied_to_id=None):
-    lines = []
-    for msg in context_messages:
-        content = clean_context(msg, guild)
-        # Attachment tagging mirrors process_v2.py build_context_lines.
-        if msg.attachments:
-            content = f"{content} [+attachment]" if content else "[shared media]"
-        if content:
-            prefix = "(replied to) " if replied_to_id and msg.id == replied_to_id else ""
-            # Username (stable) for speaker labels, matching training; bot's own -> "you".
-            name = "you" if msg.author == client.user else msg.author.name
-            lines.append(f"{prefix}{name}: {content}")
-    return "\n".join(lines)
+def speaker_name(msg):
+    return PERSONA_NAME if (client.user and msg.author.id == client.user.id) else msg.author.name
 
 
-def generate(context_text, guild=None, allow_none=True):
-    # Match training exactly: training fed the clean SYSTEM_PROMPT (no "/no_think").
-    # Appending "/no_think" put the GGUF prompt out-of-distribution, collapsing the
-    # action choice toward none/react and suppressing gif. The GBNF grammar already
-    # forces JSON output, so thinking can't leak regardless.
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": context_text},
-    ]
+def build_transcript(history, guild):
+    """Chronological messages -> transcript with consecutive same-author merge."""
+    turns = []
+    for msg in history:
+        rendered = render_ctx_msg(msg, guild)
+        if rendered is None:
+            continue
+        aid = msg.author.id
+        ts = msg.created_at.timestamp()
+        if turns and turns[-1]["aid"] == aid and ts - turns[-1]["ts"] <= MERGE_WINDOW:
+            turns[-1]["parts"].append(rendered)
+            turns[-1]["ts"] = ts
+        else:
+            turns.append({"aid": aid, "name": speaker_name(msg), "parts": [rendered], "ts": ts})
+    # Cap to the last N turns, then trim to the char budget from the most recent end —
+    # identical to process_v2.build_context so inference matches training.
+    turns = turns[-CONTEXT_MAX_TURNS:]
+    lines = [f"{t['name']}: " + "\n".join(t["parts"]) for t in turns]
+    out, kept, total = [], [], 0
+    for line, t in zip(reversed(lines), reversed(turns)):
+        if out and total + len(line) > CONTEXT_MAX_CHARS:
+            break
+        out.append(line)
+        kept.append(t)
+        total += len(line)
+    out.reverse()
+    names = {t["name"] for t in kept} | {PERSONA_NAME}
+    return "\n".join(out), names
 
-    if USE_HF:
-        inputs = tokenizer.apply_chat_template(
-            messages, tokenize=True, add_generation_prompt=True, return_tensors="pt",
-            enable_thinking=False,
-        ).to(model.device)
+
+# ---------------------------------------------------------------------------
+# Generation
+# ---------------------------------------------------------------------------
+def _truncate_at_speaker(text, known_names):
+    cut = len(text)
+    for n in known_names:
+        idx = text.find(f"\n{n}:")
+        if idx != -1:
+            cut = min(cut, idx)
+    return text[:cut]
+
+
+def generate_persona(prompt, known_names):
+    stops = [f"\n{n}:" for n in known_names]
+    if persona["kind"] == "hf":
+        torch = persona["torch"]
+        tok = persona["tokenizer"]
+        inputs = tok(prompt, return_tensors="pt").to(persona["model"].device)
         with torch.no_grad():
-            output = model.generate(
-                inputs,
-                max_new_tokens=MAX_TOKENS,
-                temperature=TEMPERATURE,
-                top_p=TOP_P,
-                do_sample=True,
-                pad_token_id=tokenizer.eos_token_id,
+            out = persona["model"].generate(
+                **inputs, max_new_tokens=MAX_TOKENS, temperature=TEMPERATURE,
+                top_p=TOP_P, do_sample=True, pad_token_id=tok.eos_token_id,
             )
-        raw = tokenizer.decode(output[0][inputs.shape[-1]:], skip_special_tokens=True)
-        return strip_thinking(raw).strip()
+        raw = tok.decode(out[0][inputs["input_ids"].shape[-1]:], skip_special_tokens=True)
     else:
-        grammar = build_action_grammar(guild, allow_none)
-        # Build the ChatML prompt by hand to exactly match the training format. Using
-        # create_chat_completion let llama-cpp-python auto-guess the chat format from the
-        # GGUF metadata; for Qwen3's complex template it fell back to a wrong format, so the
-        # model saw an out-of-distribution prompt at inference (gif never chosen, react/none
-        # over-chosen). The model is verified correct when given this exact ChatML (matches
-        # the HF backend). llama.cpp parses <|im_start|>/<|im_end|> as special tokens.
-        prompt = (
-            f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
-            f"<|im_start|>user\n{context_text}<|im_end|>\n"
-            f"<|im_start|>assistant\n"
-        )
-        response = llm(
-            prompt,
-            max_tokens=MAX_TOKENS,
-            temperature=TEMPERATURE,
-            top_p=TOP_P,
-            grammar=grammar,
-        )
-        raw = response["choices"][0]["text"]
-        return strip_thinking(raw).strip()
+        resp = persona["llm"](prompt, max_tokens=MAX_TOKENS, temperature=TEMPERATURE,
+                              top_p=TOP_P, stop=stops[:8])
+        raw = resp["choices"][0]["text"]
+    raw = raw.strip()
+    if raw.lower().startswith(PERSONA_NAME.lower() + ":"):
+        raw = raw[len(PERSONA_NAME) + 1:].strip()
+    return _truncate_at_speaker(raw, known_names).strip()
 
 
-def parse_action(raw_output):
-    json_match = re.search(r"\{[^{}]*\}", raw_output)
-    if not json_match:
+def generate_reaction(prompt):
+    if reaction["kind"] == "hf":
+        torch = reaction["torch"]
+        tok = reaction["tokenizer"]
+        inputs = tok(prompt, return_tensors="pt").to(reaction["model"].device)
+        with torch.no_grad():
+            out = reaction["model"].generate(
+                **inputs, max_new_tokens=8, do_sample=False, pad_token_id=tok.eos_token_id,
+            )
+        return tok.decode(out[0][inputs["input_ids"].shape[-1]:], skip_special_tokens=True).strip()
+    resp = reaction["llm"](prompt, max_tokens=12, temperature=0.3,
+                           grammar=reaction_grammar(), stop=["\n"])
+    return resp["choices"][0]["text"].strip()
+
+
+def decide_reaction(transcript):
+    """Return an emoji string (':name:' or unicode) or None."""
+    if reaction is not None:
+        out = generate_reaction(transcript + REACT_CUE)
+        low = out.strip().lower()
+        if not low or low.startswith("none"):
+            return None
+        for e in REACTION_VOCAB:
+            if e in out:
+                return e
+        m = re.search(r":(\w+):", out)
+        if m:
+            return m.group(0)
+        token = out.split()[0] if out.split() else None
+        return token
+    # phase-1 heuristic: weighted draw from Dinner's reaction history
+    if not REACTION_FREQ:
         return None
-    try:
-        action = json.loads(json_match.group())
-    except json.JSONDecodeError:
-        return None
-    if action.get("action") not in ("reply", "react", "gif", "reply_react", "none"):
-        return None
-    return action
+    return random.choices(REACTION_VOCAB, weights=list(REACTION_FREQ.values()))[0]
 
 
-def resolve_output_mentions(text, mention_names, guild):
+# ---------------------------------------------------------------------------
+# Output handling
+# ---------------------------------------------------------------------------
+def resolve_output_mentions(text, guild):
     if not guild:
         return text
-
-    def resolve_mention(match):
+    def resolve(match):
         name = match.group(1).lower().rstrip(".")
         for member in guild.members:
             if member.name.lower() == name or (member.nick and member.nick.lower() == name):
                 return member.mention
         return match.group(0)
-
-    # Allow dots — new Discord usernames can contain them (e.g. dinner.lore).
-    text = re.sub(r"@([a-zA-Z0-9_.]+)", resolve_mention, text)
-    return text
+    return re.sub(r"@([a-zA-Z0-9_.]+)", resolve, text)
 
 
 def resolve_output_emojis(text, guild):
     if not guild:
         return text
-
-    def resolve_emoji(match):
+    def resolve(match):
         name = match.group(1)
         for emoji in guild.emojis:
             if emoji.name.lower() == name.lower():
                 return str(emoji)
         return match.group(0)
-
-    return re.sub(r":(\w+):", resolve_emoji, text)
+    return re.sub(r":(\w+):", resolve, text)
 
 
 def resolve_reaction_emoji(text, guild):
-    custom_match = re.match(r"^:(\w+):$", text)
-    if custom_match and guild:
-        name = custom_match.group(1)
+    m = re.match(r"^:(\w+):$", text)
+    if m and guild:
         for emoji in guild.emojis:
-            if emoji.name.lower() == name.lower():
+            if emoji.name.lower() == m.group(1).lower():
                 return emoji
     return text
 
@@ -309,11 +304,8 @@ def search_gif(query):
     if not gif_index:
         return None
     query_words = set(query.lower().split())
-    scored = []
-    for url, slug_words in gif_index.items():
-        overlap = query_words & set(slug_words)
-        if overlap:
-            scored.append((len(overlap), url))
+    scored = [(len(query_words & set(words)), url)
+              for url, words in gif_index.items() if query_words & set(words)]
     if not scored:
         return None
     scored.sort(key=lambda x: -x[0])
@@ -321,67 +313,59 @@ def search_gif(query):
     return random.choice(top[:3])
 
 
-async def dispatch_action(action, message):
-    action_type = action["action"]
-    guild = message.guild
-    channel_tag = f"[#{message.channel.name}]"
-
-    if action_type == "none":
-        print(f"{channel_tag} Action: none")
-        return
-
-    if action_type in ("reply", "reply_react"):
-        text = action.get("text", "")
+def split_segments(raw, guild):
+    """Split a (possibly multi-line, gif-containing) completion into ordered
+    send segments: ('text', str) and ('gif', url)."""
+    segments = []
+    for line in raw.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        gifs = GIF_TOKEN_RE.findall(line)
+        text = GIF_TOKEN_RE.sub("", line).strip()
         if text:
-            mention_names = action.get("mentions", [])
-            text = resolve_output_mentions(text, mention_names, guild)
+            text = resolve_output_mentions(text, guild)
             text = resolve_output_emojis(text, guild)
-            text = re.sub(r"https?://\S+", "", text).strip()
+            text = URL_RE.sub("", text).strip()
             if text:
-                print(f"{channel_tag} Action: {action_type} -> {text}")
-                await message.reply(
-                    text,
-                    mention_author=False,
-                    allowed_mentions=discord.AllowedMentions(everyone=False),
-                )
-
-    if action_type in ("react", "reply_react"):
-        emoji_str = action.get("emoji", "")
-        if emoji_str:
-            emoji = resolve_reaction_emoji(emoji_str, guild)
-            if emoji:
-                print(f"{channel_tag} Action: react -> {emoji}")
-                await message.add_reaction(emoji)
-
-    if action_type == "gif":
-        query = action.get("query", "")
-        if query:
-            gif_url = search_gif(query)
-            if gif_url:
-                print(f"{channel_tag} Action: gif ({query!r}) -> {gif_url}")
-                await message.reply(
-                    gif_url,
-                    mention_author=False,
-                    allowed_mentions=discord.AllowedMentions(everyone=False),
-                )
-            else:
-                print(f"{channel_tag} No GIF match for {query!r}")
+                segments.append(("text", text))
+        if GIF_ENABLED:
+            for q in gifs:
+                url = search_gif(q)
+                if url:
+                    segments.append(("gif", url))
+    return segments[:MAX_SEGMENTS]
 
 
+async def send_segments(segments, message):
+    allowed = discord.AllowedMentions(everyone=False)
+    first = True
+    for kind, payload in segments:
+        if first:
+            await message.reply(payload, mention_author=False, allowed_mentions=allowed)
+            first = False
+        else:
+            await message.channel.send(payload, allowed_mentions=allowed)
+        print(f"  -> {kind}: {payload}")
+
+
+# ---------------------------------------------------------------------------
+# Discord events
+# ---------------------------------------------------------------------------
 @client.event
 async def on_ready():
     print(f"Bot online as {client.user}")
-    print(f"Engagement chance: {ENGAGEMENT_CHANCE * 100}%")
+    print(f"Persona name: {PERSONA_NAME} | engagement: {ENGAGEMENT_CHANCE:.0%} | "
+          f"react: {REACT_CHANCE:.0%} | gifs: {GIF_ENABLED}")
     print(f"Allowed channels: {ALLOWED_CHANNELS}")
-    print(f"GIF index: {len(gif_index)} GIFs loaded")
 
 
 async def get_reply_chain_depth(message):
-    depth = 0
-    current = message
+    depth, current = 0, message
     while current.reference and current.reference.message_id:
         try:
-            ref = current.reference.cached_message or await current.channel.fetch_message(current.reference.message_id)
+            ref = current.reference.cached_message or \
+                await current.channel.fetch_message(current.reference.message_id)
         except (discord.NotFound, discord.HTTPException):
             break
         if ref.author == client.user:
@@ -395,18 +379,18 @@ async def on_message(message):
     if message.author == client.user:
         return
 
-    in_allowed_channel = message.channel.id in ALLOWED_CHANNELS
+    in_allowed = message.channel.id in ALLOWED_CHANNELS
     mentioned = REPLY_ON_MENTION and client.user in message.mentions
     replied_to_bot = (
-        message.reference
-        and message.reference.cached_message
+        message.reference and message.reference.cached_message
         and message.reference.cached_message.author == client.user
     )
     forced = mentioned or replied_to_bot
 
-    if not forced and not in_allowed_channel:
+    if not forced and not in_allowed:
         return
 
+    # --- decide whether to reply ---
     should_engage = False
     if forced:
         should_engage = True
@@ -417,63 +401,46 @@ async def on_message(message):
     else:
         should_engage = random.random() <= ENGAGEMENT_CHANCE
 
-    if not should_engage:
+    # --- decide whether to react (independent of replying) ---
+    do_react = should_engage or (in_allowed and random.random() < REACT_CHANCE)
+
+    if not should_engage and not do_react:
         return
 
     history = []
-    async for msg in message.channel.history(limit=CONTEXT_MESSAGES + 1):
+    async for msg in message.channel.history(limit=FETCH_LIMIT + 1):
         history.append(msg)
     history.reverse()
 
-    replied_to_id = None
-    if message.reference and message.reference.message_id:
-        replied_to_id = message.reference.message_id
-        if not any(m.id == replied_to_id for m in history):
-            try:
-                ref_msg = await message.channel.fetch_message(replied_to_id)
-                history.insert(0, ref_msg)
-            except discord.NotFound:
-                pass
-
-    context_text = build_prompt(history, guild=message.guild, replied_to_id=replied_to_id)
-    if not context_text:
+    transcript, known_names = build_transcript(history, message.guild)
+    if not transcript:
         return
 
     channel_tag = f"[#{message.channel.name}]"
-    print(f"{channel_tag} Context:\n{context_text}")
 
-    async with message.channel.typing():
-        raw_output = generate(context_text, guild=message.guild, allow_none=not forced)
+    if should_engage:
+        prompt = f"{transcript}\n{PERSONA_NAME}:"
+        async with message.channel.typing():
+            raw = generate_persona(prompt, known_names)
+        print(f"{channel_tag} Raw: {raw!r}")
+        segments = split_segments(raw, message.guild)
+        if segments:
+            try:
+                await send_segments(segments, message)
+            except discord.HTTPException as e:
+                print(f"{channel_tag} Send failed: {e}")
 
-    print(f"{channel_tag} Raw output: {raw_output!r}")
-    action = parse_action(raw_output)
-
-    if action is None:
-        if forced:
-            cleaned = re.sub(r"https?://\S+", "", raw_output).strip()
-            if cleaned:
-                print(f"{channel_tag} Fallback plain reply: {cleaned}")
-                await message.reply(
-                    cleaned,
-                    mention_author=False,
-                    allowed_mentions=discord.AllowedMentions(everyone=False),
-                )
-        else:
-            print(f"{channel_tag} Unparseable output, ignoring")
-        return
-
-    try:
-        await dispatch_action(action, message)
-    except discord.HTTPException as e:
-        print(f"{channel_tag} Dispatch failed: {e}")
-    except Exception as e:
-        print(f"{channel_tag} Unexpected error: {e}")
-
-
-@client.event
-async def on_guild_emojis_update(guild, before, after):
-    for key in [k for k in _grammar_cache if k[0] == guild.id]:
-        _grammar_cache.pop(key, None)
+    if do_react and message.guild:
+        try:
+            emoji_str = decide_reaction(transcript)
+            if emoji_str:
+                emoji = resolve_reaction_emoji(emoji_str, message.guild)
+                await message.add_reaction(emoji)
+                print(f"{channel_tag} React: {emoji_str}")
+        except (discord.HTTPException, discord.InvalidArgument) as e:
+            print(f"{channel_tag} React failed: {e}")
+        except Exception as e:
+            print(f"{channel_tag} React error: {e}")
 
 
 def main():
